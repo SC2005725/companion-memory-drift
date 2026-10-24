@@ -1566,7 +1566,7 @@ AI 不应该只负责“写代码”。
 项目里已经实际发生过两次事故，都是「测试工具把实验对象自己删了」：
 
 1. 为了做回归测试跑了 `selftest --clean`，删掉 3 轮真实验证对话与费用账本；
-2. 修了一版清理逻辑之后，`selftest --clean` 又删掉了实验基准事件 `baseline-event`
+2. 修了一版清理逻辑之后，`selftest --clean` 又删掉了实验基准事件 `raw_event_001`
    —— 三层缺陷叠加：通配删除 → 改成按「表里全部事件」删除 → `conn.close()` 排在
    `_clean()` 之前导致清理静默失败（`sqlite3.ProgrammingError` 被输出过滤掩盖）。
 

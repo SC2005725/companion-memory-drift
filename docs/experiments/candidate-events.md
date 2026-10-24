@@ -1,6 +1,6 @@
 # 候选虚构测试事件（3 个）
 
-用途：将来 Memory Drift 实验中作为 `baseline-event` 的**原始事实**。
+用途：将来 Memory Drift 实验中作为 `raw_event_001` 的**原始事实**。
 **尚未开始 Memory Drift 实验**，本文件只是候选清单，符合任务书「先给 3 个候选事件」的要求。
 
 ## 挑选标准
@@ -86,6 +86,6 @@
 3. 不涉及家庭住址类信息。
 
 选定之后需要做的事（**现在不做**）：
-1. 把选定事件的原话固化成 `baseline-event`（走 `python src\main.py events` 可查看）；
+1. 把选定事件的原话固化成 `raw_event_001`（走 `python src\main.py events` 可查看）；
 2. 记录一份**人工标注的事实清单**（A1–A4 / B1–B4 / C1–C4），作为日后对比的基准答案；
 3. 再进入 Phase 4。

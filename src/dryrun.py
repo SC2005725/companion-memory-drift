@@ -9,7 +9,7 @@
 
     假客户端 → 多轮对话 → consolidate → v001 → 继续对话
     → v002 → v003 → recall 两种模式 → 生成报告
-    → verify → 检查 baseline-event 文件与数据库行是否仍在
+    → verify → 检查 raw_event_001 文件与数据库行是否仍在
 
 ## 三条硬保证
 
@@ -22,7 +22,7 @@
 ## 为什么必须先复制再跑
 
 项目里已经发生过两次「测试工具把实验对象自己删了」的事故
-（`selftest --clean` 删掉 3 轮真实对话；修了一版之后又删掉基准事件 `baseline-event`）。
+（`selftest --clean` 删掉 3 轮真实对话；修了一版之后又删掉基准事件 `raw_event_001`）。
 所以现在定为规则：**任何可能 DELETE / 清理 / 重建 / 批量修改数据的操作，
 一律先复制到临时目录、在副本上跑。正式实验数据视为只读证据。**
 
@@ -309,7 +309,7 @@ def main(argv=None) -> int:
     # 记录真实目录的状态指纹，演练末尾要复核它没被改动
     real_probe = {}
     real_events_dir = REAL_ROOT / "memory" / "raw" / "events"
-    for f in ("baseline-event.json", "baseline-event.sha256"):
+    for f in ("raw_event_001.json", "raw_event_001.sha256"):
         p = real_events_dir / f
         real_probe[f] = p.read_bytes() if p.exists() else None
     real_db = REAL_ROOT / "conversation" / "conversations.db"
@@ -325,10 +325,10 @@ def main(argv=None) -> int:
                               peak_override=False, conn=conn)
 
     # ---------- [1] 固化基准事件（在副本里）----------
-    print("\n[1] 固化基准事件 baseline-event（副本内）")
+    print("\n[1] 固化基准事件 raw_event_001（副本内）")
     seed = seed_mod.seed(conn)
     check("基准事件已在副本中固化", seed["created"], seed.get("event_id", ""))
-    base_file = paths.RAW_EVENTS_DIR / "baseline-event.json"
+    base_file = paths.RAW_EVENTS_DIR / "raw_event_001.json"
     check("基准事件文件存在", base_file.exists(), str(base_file.name))
     print(f"  {seed['event_id']}  {seed['chars']} 字  sha256={seed['sha256'][:12]}…")
     before_base_sha = storage.sha256_text(base_file.read_text(encoding="utf-8").rstrip("\n"))
@@ -530,7 +530,7 @@ def main(argv=None) -> int:
     # ---------- [8] 关键：基准事件是否完好 ----------
     print("\n[8] 基准事件完整性（副本内）")
     after_base_sha = storage.sha256_text(base_file.read_text(encoding="utf-8").rstrip("\n"))
-    row = conn.execute("SELECT * FROM events WHERE event_id = 'baseline-event'").fetchone()
+    row = conn.execute("SELECT * FROM events WHERE event_id = 'raw_event_001'").fetchone()
     check("基准事件文件仍在", base_file.exists(), "")
     check("基准事件内容未被改动", after_base_sha == before_base_sha, "")
     check("基准事件数据库行仍在", row is not None, "")
@@ -551,7 +551,7 @@ def main(argv=None) -> int:
     print("\n[10] 真实目录只读性复核（最重要的一项）")
     ok_real = True
     for f, before in real_probe.items():
-        p = (real_events_dir / f) if f.endswith((".json", ".sha256")) and f.startswith("baseline-event") else real_db
+        p = (real_events_dir / f) if f.endswith((".json", ".sha256")) and f.startswith("raw_event_001") else real_db
         after = p.read_bytes() if p.exists() else None
         same = (after == before)
         ok_real = ok_real and same
@@ -588,9 +588,9 @@ def main(argv=None) -> int:
     不要改成「看到任何事实都记录」—— 那会让原始事件数量失控，实验更难解释。
 
 缺口 2：基准事件与对话事实之间没有 source_event_ids 关联 —— 按决定暂不修复
-  《project-spec》§5 要求每条记忆可追溯。目前基准事件 baseline-event 是夹具固化的
+  《project-spec》§5 要求每条记忆可追溯。目前基准事件 raw_event_001 是夹具固化的
   「档案事实」，与整理时从对话提取的条目在数据上没有引用关系。
-  用户决定：**暂不修复**。理由是现在已有「baseline-event → 人工标注事实清单」
+  用户决定：**暂不修复**。理由是现在已有「raw_event_001 → 人工标注事实清单」
   这条基准链路，而为了本轮实验的可比性临时新增一套来源关联机制，
   反而可能改变实验环境。正式实验结束后再决定是否补。
   本次演练已改用真实事件 ID 构造整理输入，证明这条链路是可用的

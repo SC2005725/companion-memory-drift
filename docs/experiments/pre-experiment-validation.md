@@ -167,9 +167,9 @@
 
 | 项 | 值 |
 |----|-----|
-| 基准事件 ID | `baseline-event` |
+| 基准事件 ID | `raw_event_001` |
 | 原文长度 | **77 字** |
-| 原文 sha256（文件内容哈希） | 见 `memory/raw/events/baseline-event.sha256` |
+| 原文 sha256（文件内容哈希） | 见 `memory/raw/events/raw_event_001.sha256` |
 | 定义文件 | `experiments/baseline-event.json` |
 | 人工标注清单 | `experiments/ground-truth-facts.md`（由定义文件自动生成） |
 | 固化命令 | `python src\main.py seed-baseline` |
@@ -181,7 +181,7 @@
 
 ### 为什么基准事件走专门的固化命令，而不是走聊天
 
-`baseline-event` 是实验的**基准事实**，要求逐字稳定、ID 固定、可重复重建。
+`raw_event_001` 是实验的**基准事实**，要求逐字稳定、ID 固定、可重复重建。
 走聊天做不到：会生成随机 `turn_id` / `event_id`，原始事件文本还会随对话上下文变化。
 
 所以它从受控定义文件固化，人工标注清单也从同一份定义生成 —— **两处同源，不会互相漂移**。
@@ -208,9 +208,9 @@ Phase 6 的 Changelog 必须能发现这类类型变化。
 
 ### 现象
 
-固化 `baseline-event` 之后跑 `python src\main.py selftest --clean`，基准事件被删除：
+固化 `raw_event_001` 之后跑 `python src\main.py selftest --clean`，基准事件被删除：
 
-- 事件文件 `baseline-event.json` 消失
+- 事件文件 `raw_event_001.json` 消失
 - 数据库里的登记行也消失
 - 更糟的是曾出现**孤儿状态**：文件还在但数据库无记录，`verify` 报「未登记」
 
@@ -229,7 +229,7 @@ Phase 6 的 Changelog 必须能发现这类类型变化。
 1. **开跑前先记下已存在的事件 ID 与会话 ID**，只清理「跑完才出现」的那些
 2. **不再 `rmtree` 整个 `conversation/` 目录** —— 改为只 `DELETE` 属于本次自测会话的行，
    数据库文件始终保留
-3. **硬保护 `baseline-event`** —— 它在 `_clean` 里被显式跳过
+3. **硬保护 `raw_event_001`** —— 它在 `_clean` 里被显式跳过
 4. **调整 `conn.close()` 到 `_clean()` 之后**
 5. 费用流水改为「只摘掉本次自测那几行」，不再整文件删除
 6. 自测的项数不再受既有事件影响（只校验自己新建的事件），稳定为 13 项
@@ -245,7 +245,7 @@ Phase 6 的 Changelog 必须能发现这类类型变化。
 （数据库文件本身、既有真实数据、memory/versions/ 均未被触碰）
 ```
 
-`baseline-event` 的**文件与数据库行均完好**，文件哈希与清理前一致，
+`raw_event_001` 的**文件与数据库行均完好**，文件哈希与清理前一致，
 `verify` 报「原始数据未被改动」，无孤儿记录。
 
 ### 教训

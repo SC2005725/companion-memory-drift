@@ -4,7 +4,7 @@
 > `experiments/baseline-event.json` **自动生成**，请勿手工编辑 ——
 > 要改内容请改那份定义文件，然后重新执行 `python src\main.py seed-baseline --force`。
 
-- 基准事件：`baseline-event`
+- 基准事件：`raw_event_001`
 - 选定事件：候选 B · 花市买的一盆茉莉
 - 选定日期：2026-10-07
 - 事实条数：4（其中 B4 含 3 个可分别判定的子项）

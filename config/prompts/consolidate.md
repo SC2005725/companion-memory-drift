@@ -61,7 +61,7 @@
     {
       "type": "FACT",
       "text": "用户曾在夜间时段工作约一年多。",
-      "source_event_ids": ["baseline-event"],
+      "source_event_ids": ["raw_event_001"],
       "confidence": 0.9,
       "replaces": ["mem_aaaaaaaaaaaa"]
     }

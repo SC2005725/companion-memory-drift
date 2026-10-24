@@ -237,7 +237,7 @@ def _verifiable_of(text: str, claim_kind: str) -> str:
 #
 # ## 为什么用户模型层现在拿不到可靠主题键
 # 实测：唯一现成的结构化主题键是**记忆层**的 `source_event_ids`
-# （6 条茉莉条目共享 `baseline-event`，ID 相等即同主题、零歧义）。
+# （6 条茉莉条目共享 `raw_event_001`，ID 相等即同主题、零歧义）。
 # **但用户模型层没有这个字段**；而且事件层只覆盖 9.2% 的对话
 # （`raw_event_triggers` 是刻意窄的事件白名单，不是主题分类体系）。
 #

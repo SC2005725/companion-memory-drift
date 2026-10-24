@@ -1,9 +1,9 @@
 {
-  "_comment": "Memory Drift 实验的基准原始事实（baseline-event）。用户选定候选 B「花市买的一盆茉莉」。本文件是受控夹具，不是聊天产物 —— 基准必须逐字稳定、可重复固化。",
+  "_comment": "Memory Drift 实验的基准原始事实（raw_event_001）。用户选定候选 B「花市买的一盆茉莉」。本文件是受控夹具，不是聊天产物 —— 基准必须逐字稳定、可重复固化。",
   "_verbatim": true,
   "_source": "experiments/candidate-events.md 的「候选 B：花市买的一盆茉莉 → 用户原话」",
 
-  "event_id": "baseline-event",
+  "event_id": "raw_event_001",
   "kind": "user_statement",
   "immutable": true,
 

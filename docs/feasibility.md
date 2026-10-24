@@ -130,7 +130,7 @@ recall/<probe_id>.json       回忆探针：提问原话 + 模型回答原文 + 
   "id": "mem_0007",
   "type": "FACT",
   "text": "用户曾在夜间时段工作约一年多。",
-  "source_event_ids": ["baseline-event"],
+  "source_event_ids": ["raw_event_001"],
   "confidence": 0.9,
   "first_seen_version": "v001",
   "last_modified_version": "v002"
@@ -309,5 +309,5 @@ DeepSeek 官方计价页（[模型 & 价格](https://api-docs.deepseek.com/zh-cn
 
 **需要你拍板的三个点：**
 - 模型选择：`deepseek-flash`（最省）还是先用本地 Ollama（免费但质量待评估）？
-- 实验事件：是否就用任务书里的「夜班工作」作为 `baseline-event`？
+- 实验事件：是否就用任务书里的「夜班工作」作为 `raw_event_001`？
 - 是否现在就开始 Phase 1–3？

@@ -292,7 +292,7 @@ def cmd_recall(args) -> int:
 
 
 def cmd_seed_baseline(args) -> int:
-    """固化实验基准事件 baseline-event（不调用模型、不花钱）。"""
+    """固化实验基准事件 raw_event_001（不调用模型、不花钱）。"""
     import seed_baseline as seed_mod
     import storage
 
@@ -871,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mem.set_defaults(func=cmd_memory)
 
     p_seed = sub.add_parser(
-        "seed-baseline", help="固化实验基准事件 baseline-event（不调用模型、不花钱）"
+        "seed-baseline", help="固化实验基准事件 raw_event_001（不调用模型、不花钱）"
     )
     p_seed.add_argument("--force", action="store_true",
                         help="先删掉已有的基准事件再重建（仅限尚未开始正式实验时）")

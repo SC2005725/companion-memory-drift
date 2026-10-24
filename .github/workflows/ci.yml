@@ -34,13 +34,16 @@ jobs:
       - name: 准备占位 .env（自测不调用模型，只为让配置加载通过）
         run: cp .env.example .env
 
+      # 注意：selftest_llm_exit 需要**真实 API Key**（它验证 doctor --online /
+      # webui._env_test 是否经 call_model 记账），因此不放进离线 CI。
+      # 本地有真 Key 时请单独跑：python src/selftest_llm_exit.py
       - name: 跑离线自测
         shell: bash
         run: |
           set -o pipefail
           fail=0
           for t in selftest_memory selftest_companion selftest_persona_state \
-                   selftest_merge selftest_tools selftest_router selftest_llm_exit \
+                   selftest_merge selftest_tools selftest_router \
                    selftest_p0_capture selftest_p2_conflict selftest_memory_source; do
             echo "=================== $t ==================="
             if ! python "src/$t.py"; then

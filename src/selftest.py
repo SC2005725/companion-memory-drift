@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     # 绝不能按「表里所有事件」去删 —— 那会把真实实验数据一起删掉。
     #
     # 这里踩过一次真实的坑：早期版本按「删除时刻表里的全部事件」清理，
-    # 结果把实验基准事件 baseline-event 删了（它是 ground truth，属于真实实验数据）。
+    # 结果把实验基准事件 raw_event_001 删了（它是 ground truth，属于真实实验数据）。
     preexisting_event_ids = {
         r["event_id"] for r in conn.execute("SELECT event_id FROM events").fetchall()
     }
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- 事件文件 ---
     #
     # 先算出「本次自测新建了哪些事件」，后续的展示、校验、清理都只针对这些。
-    # 这样即便 events 表里已有真实实验数据（如基准事件 baseline-event），
+    # 这样即便 events 表里已有真实实验数据（如基准事件 raw_event_001），
     # 自测的项数与报告也不会被它们影响，更不会去动它们。
     created_event_ids = [
         r["event_id"]
@@ -308,7 +308,7 @@ def _clean(conn, event_ids: list[str], keep_session_ids: set, test_session_id: s
 
     2. **不按 `glob("*")` 通配删事件文件**，只按 ID 精确删。
 
-    3. **硬保护基准事件 ID**（`baseline-event`）。它是实验 ground truth，
+    3. **硬保护基准事件 ID**（`raw_event_001`）。它是实验 ground truth，
        属于真实实验数据，不是测试产物。
 
     `keep_session_ids` 是自测开跑前就存在的会话 ID 集合；`test_session_id` 是本次自测的。
@@ -316,7 +316,7 @@ def _clean(conn, event_ids: list[str], keep_session_ids: set, test_session_id: s
     """
     from paths import LEDGER_FILE, RAW_EVENTS_DIR
 
-    PROTECTED_EVENT_IDS = {"baseline-event"}
+    PROTECTED_EVENT_IDS = {"raw_event_001"}
 
     # --- 1) 事件文件：按 ID 精确删，跳过受保护的 ---
     removed_events = 0

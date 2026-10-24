@@ -69,21 +69,21 @@
 ### v001（19 条）
 
 - `[FACT]` 用户上个月在花市买了一盆茉莉。
-  - id=mem_4c84acdecdbd　来源=baseline-event、raw_event_0f1e47c8　confidence=0.95
+  - id=mem_4c84acdecdbd　来源=raw_event_001、raw_event_0f1e47c8　confidence=0.95
 - `[UNKNOWN]` 卖家说这盆茉莉是去年的苗。
-  - id=mem_0e244eef3e47　来源=baseline-event、raw_event_ec98af25　confidence=0.85
+  - id=mem_0e244eef3e47　来源=raw_event_001、raw_event_ec98af25　confidence=0.85
 - `[FACT]` 卖家没有说过这盆茉莉是什么品种。
   - id=mem_3b386631a7f6　来源=raw_event_ec98af25　confidence=0.8
 - `[FACT]` 这盆茉莉特别怕冷。
-  - id=mem_06f2859cbd3e　来源=baseline-event、raw_event_08c4413e　confidence=0.95
+  - id=mem_06f2859cbd3e　来源=raw_event_001、raw_event_08c4413e　confidence=0.95
 - `[FACT]` 冬天用户得把这盆茉莉搬进屋里。
-  - id=mem_b75ed6082340　来源=baseline-event、raw_event_08c4413e　confidence=0.95
+  - id=mem_b75ed6082340　来源=raw_event_001、raw_event_08c4413e　confidence=0.95
 - `[FACT]` 用户把这盆茉莉放在书桌旁边的窗台上。
-  - id=mem_173820a6b996　来源=baseline-event　confidence=0.9
+  - id=mem_173820a6b996　来源=raw_event_001　confidence=0.9
 - `[FACT]` 这盆茉莉大概六月份才会开花。
-  - id=mem_bf6333e796b6　来源=baseline-event、raw_event_d79f6f9d　confidence=0.9
+  - id=mem_bf6333e796b6　来源=raw_event_001、raw_event_d79f6f9d　confidence=0.9
 - `[FACT]` 前几天这盆茉莉掉了几个花苞，用户有点心疼。
-  - id=mem_12eb778193a0　来源=baseline-event、raw_event_cb1cfc16　confidence=0.95
+  - id=mem_12eb778193a0　来源=raw_event_001、raw_event_cb1cfc16　confidence=0.95
 - `[FACT]` 用户名叫（网名）。
   - id=mem_f16685546060　来源=无来源　confidence=0.9
 - `[FACT]` 用户今天看了三本书。
@@ -110,17 +110,17 @@
 ### v002（10 条）
 
 - `[FACT]` 用户上个月在花市买了一盆茉莉。
-  - id=mem_4c84acdecdbd　来源=baseline-event、raw_event_0f1e47c8　confidence=0.95
+  - id=mem_4c84acdecdbd　来源=raw_event_001、raw_event_0f1e47c8　confidence=0.95
 - `[UNKNOWN]` 卖家说这盆茉莉是去年的苗（用户未自行确认）。
-  - id=mem_6fce5660ad16　来源=baseline-event、raw_event_ec98af25　confidence=0.8
+  - id=mem_6fce5660ad16　来源=raw_event_001、raw_event_ec98af25　confidence=0.8
 - `[FACT]` 这盆茉莉特别怕冷，冬天得搬进屋里。
-  - id=mem_f1102d71073d　来源=baseline-event、raw_event_08c4413e　confidence=0.95
+  - id=mem_f1102d71073d　来源=raw_event_001、raw_event_08c4413e　confidence=0.95
 - `[FACT]` 这盆茉莉大概六月份才会开花。
-  - id=mem_bf6333e796b6　来源=baseline-event、raw_event_d79f6f9d　confidence=0.9
+  - id=mem_bf6333e796b6　来源=raw_event_001、raw_event_d79f6f9d　confidence=0.9
 - `[FACT]` 前两天茉莉掉了几个花苞，用户有点心疼。
-  - id=mem_dd57596d3c20　来源=baseline-event、raw_event_cb1cfc16　confidence=0.95
+  - id=mem_dd57596d3c20　来源=raw_event_001、raw_event_cb1cfc16　confidence=0.95
 - `[FACT]` 用户最初说茉莉放在书桌旁边的窗台上，后来表示这是记错了。
-  - id=mem_89263f51d967　来源=baseline-event、raw_event_e219e647　confidence=0.9
+  - id=mem_89263f51d967　来源=raw_event_001、raw_event_e219e647　confidence=0.9
 - `[FACT]` 用户更正：茉莉其实是放在阳台。
   - id=mem_0298e9455b03　来源=raw_event_e219e647　confidence=0.95
 - `[FACT]` 用户在做「最小聊天原型」，分为 Phase 1-5。
@@ -133,17 +133,17 @@
 ### v003（11 条）
 
 - `[FACT]` 用户上个月在花市买了一盆茉莉。
-  - id=mem_4c84acdecdbd　来源=baseline-event、raw_event_0f1e47c8　confidence=0.95
+  - id=mem_4c84acdecdbd　来源=raw_event_001、raw_event_0f1e47c8　confidence=0.95
 - `[UNKNOWN]` 卖家说这盆茉莉是去年的苗（用户转述卖家说法）。
-  - id=mem_72805191c482　来源=baseline-event、raw_event_ec98af25　confidence=0.6
+  - id=mem_72805191c482　来源=raw_event_001、raw_event_ec98af25　confidence=0.6
 - `[FACT]` 这盆茉莉特别怕冷，冬天得搬进屋里。
-  - id=mem_f1102d71073d　来源=baseline-event、raw_event_08c4413e　confidence=0.95
+  - id=mem_f1102d71073d　来源=raw_event_001、raw_event_08c4413e　confidence=0.95
 - `[FACT]` 这盆茉莉大概六月份才会开花。
-  - id=mem_bf6333e796b6　来源=baseline-event、raw_event_d79f6f9d　confidence=0.9
+  - id=mem_bf6333e796b6　来源=raw_event_001、raw_event_d79f6f9d　confidence=0.9
 - `[FACT]` 前两天这盆茉莉掉了几个花苞，用户有点心疼。
-  - id=mem_c9cb98c9318e　来源=baseline-event、raw_event_cb1cfc16　confidence=0.95
+  - id=mem_c9cb98c9318e　来源=raw_event_001、raw_event_cb1cfc16　confidence=0.95
 - `[FACT]` 用户之前说茉莉放在书桌旁边的窗台，后来更正是记错了。
-  - id=mem_0673d1034ab9　来源=baseline-event、raw_event_e219e647　confidence=0.95
+  - id=mem_0673d1034ab9　来源=raw_event_001、raw_event_e219e647　confidence=0.95
 - `[FACT]` 这盆茉莉现在放在阳台。
   - id=mem_3b633dc56b6a　来源=raw_event_e219e647、raw_event_fa425627　confidence=0.95
 - `[FACT]` 用户所在的地方冬天不是很冷。
