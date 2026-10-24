@@ -36,6 +36,9 @@ jobs:
 
       - name: 配置 Pages
         uses: actions/configure-pages@v5
+        with:
+          # 首次运行时自动开启 Pages（省去手动去 Settings 里设置）
+          enablement: true
 
       - name: 上传产物
         uses: actions/upload-pages-artifact@v3
