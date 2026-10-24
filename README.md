@@ -1,9 +1,17 @@
-# Companion · 关系型 AI 记忆偏移实验
+<!-- README_SYNC: source=working-tree; updated=2026-10-25 -->
+
+<p align="center">
+  简体中文 · <a href="./README_EN.md">English</a>
+</p>
+
+# 共生 · 关系型 AI 记忆偏移实验
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-2ea44f.svg)](https://SC2005725.github.io/companion-memory-drift/)
 [![CI](https://github.com/SC2005725/companion-memory-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/SC2005725/companion-memory-drift/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-2ea44f.svg)](https://SC2005725.github.io/companion-memory-drift/)
+[![Stars](https://img.shields.io/github/stars/SC2005725/companion-memory-drift?label=Stars&color=f5b301)](https://github.com/SC2005725/companion-memory-drift/stargazers)
+[![Last Commit](https://img.shields.io/github/last-commit/SC2005725/companion-memory-drift)](https://github.com/SC2005725/companion-memory-drift/commits/main)
 
 > 一个**关系型 AI Companion** 的最小可用原型：**小、能跑、能搬走**。
 >
@@ -11,7 +19,42 @@
 > **给一个 AI 初始人格和有限过去，让它长期和一个人相处，
 > 它能否逐渐长出属于自己的记忆、判断、行为与关系。**
 
+<p align="center">
+  <a href="https://github.com/SC2005725/companion-memory-drift/stargazers">
+    <img src="https://img.shields.io/badge/%E2%AD%90_Star-%E6%94%B6%E8%97%8F%E5%B9%B6%E5%B8%AE%E5%90%8C%E7%B1%BB%E9%A1%B9%E7%9B%AE%E8%A2%AB%E7%9C%8B%E8%A7%81-f5b301?style=for-the-badge" alt="Star this repo">
+  </a>
+</p>
+
+**如果这个项目对你有用，点一个 Star，方便以后回来，也让更多在做同类实验的人更容易发现它。**
+
 **📖 文档站：https://SC2005725.github.io/companion-memory-drift/** ｜ 详细进度见 [`docs/project-report.md`](docs/project-report.md)
+
+---
+
+## 三十秒：它和"套壳聊天机器人"差在哪
+
+| 常见做法 | 共生怎么做 |
+|---|---|
+| 记忆存进向量库，靠相似度召回 | **纯关键词 + 2-gram 打分**；无向量库、无 embedding、无新增依赖 |
+| 让模型决定"该记什么" | **规则决定一切** —— 分类、关系推导、用户建模、行为审计全是确定性代码 |
+| 人格写死在提示词里 | 人格分三层：**稳定底色（sha256 守护）· 可发展层 · 用户模型** |
+| 让 AI"感觉"有情绪 | **不假装**。情感状态是数值记账，代码里明确声明它 ≠ 主观感受 |
+| 聊天记录随手改 | **原始数据不可变**：记忆只追加、带 sha256、程序拒绝覆盖 |
+
+> ## 🚧 当前为内测项目
+>
+> **本项目处于内测阶段，仅供研究与个人自用，不适合生产环境。**
+>
+> - **接口与数据格式可能随时变动**，不承诺向后兼容
+> - **尚无长期真实运行验证** —— 已知限制全部如实列在下方
+> - **不要用它处理敏感数据**，也不要指望它替你保管重要内容
+> - 遇到问题欢迎开 Issue，但**不承诺修复时间**
+>
+> 如果你只是想看看"给 AI 一段有限过去会发生什么"，那它现在正好能跑。
+
+> **它现在只到原型阶段。** 五条链路（人格出口 / 发展闭环 / 心跳 / 情感 / 模型适配）
+> 全部接好、全部自测通过，但**尚未在长期真实运行中验证** ——
+> 如实清单见 [`## 14. 已知限制`](#14-已知限制)。
 
 ---
 
@@ -596,3 +639,24 @@ execute   会执行本机命令（**默认关**）
   `python src\main.py selftest --clean`；**正式实验开始后，删原始数据等于毁掉实验**。
 - 任何可能删改数据的测试都**先在副本上跑**（`dryrun.py` 就是这么做的）。
 - **别把 `--clean` 类命令指向真实项目**；开发期我在这上面出过事（见实验记录 §11）。
+
+---
+
+## 参与
+
+两个入口：
+
+- **有问题 / 想投功能** → [开 Issue](https://github.com/SC2005725/companion-memory-drift/issues)
+- **想直接改代码** → 先读 [CONTRIBUTING.md](CONTRIBUTING.md)，安全相关问题见 [SECURITY.md](SECURITY.md)
+
+<p align="center">
+  <a href="https://github.com/SC2005725/companion-memory-drift/stargazers">⭐ Star</a> ·
+  <a href="https://github.com/SC2005725/companion-memory-drift/releases">Watch releases</a> ·
+  <a href="https://github.com/SC2005725/companion-memory-drift/issues">开 Issue</a>
+</p>
+
+如果这套东西解决了你的实际问题，点个 Star —— 首屏那个是为了让新访客看见，这个是为了你读完之后的确认。两处不重复。
+
+## 许可
+
+[Apache License 2.0](LICENSE) — 详见 [NOTICE](NOTICE)。
