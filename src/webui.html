@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小满</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --panel:#ffffff; --line:#e4e6ea; --ink:#1f2328; --dim:#6b7280;
+    --accent:#4f46e5; --accent-soft:#eef2ff; --ok:#16a34a; --warn:#d97706;
+    --err:#dc2626; --bubble:#ffffff; --me:#4f46e5;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:var(--bg); color:var(--ink); display:flex; overflow:hidden;
+  }
+  /* ---------- 主区 ---------- */
+  main{flex:1; display:flex; flex-direction:column; min-width:0}
+  header{
+    padding:14px 22px; background:var(--panel); border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:12px; flex-shrink:0;
+  }
+  header h1{font-size:16px; margin:0; font-weight:600}
+  header .sub{color:var(--dim); font-size:13px}
+  #conn{margin-left:auto; font-size:12px; color:var(--dim)}
+  #conn b{font-weight:600}
+  #log{flex:1; overflow-y:auto; padding:22px; display:flex; flex-direction:column; gap:16px}
+  .row{display:flex; gap:10px; max-width:820px; width:100%}
+  .row.me{align-self:flex-end; flex-direction:row-reverse}
+  .who{
+    width:30px;height:30px;border-radius:50%;flex-shrink:0;
+    display:grid;place-items:center;font-size:12px;font-weight:600;color:#fff;background:var(--accent)
+  }
+  .row.me .who{background:#94a3b8}
+  .bubble{
+    background:var(--bubble); border:1px solid var(--line); border-radius:12px;
+    padding:11px 15px; white-space:pre-wrap; word-break:break-word; min-width:0;
+  }
+  .row.me .bubble{background:var(--me); color:#fff; border-color:var(--me)}
+  .meta{font-size:12px; color:var(--dim); margin-top:7px; display:flex; flex-wrap:wrap; gap:8px}
+  .chip{
+    background:var(--accent-soft); color:var(--accent); border-radius:20px;
+    padding:1px 9px; font-size:11.5px; font-weight:500
+  }
+  .chip.deny{background:#fef2f2;color:var(--err)}
+  .chip.ok{background:#f0fdf4;color:var(--ok)}
+  .err{color:var(--err); font-size:13px; background:#fef2f2; border:1px solid #fecaca;
+       border-radius:10px; padding:10px 14px; max-width:820px}
+  .tip{color:var(--dim); font-size:13px; text-align:center; padding:8px}
+  /* ---------- 输入 ---------- */
+  .composer{
+    padding:14px 22px 18px; background:var(--panel); border-top:1px solid var(--line);
+    display:flex; gap:10px; align-items:flex-end; flex-shrink:0;
+  }
+  textarea{
+    flex:1; resize:none; border:1px solid var(--line); border-radius:12px;
+    padding:11px 14px; font:inherit; outline:none; max-height:180px; min-height:46px;
+    background:#fff; color:var(--ink)
+  }
+  textarea:focus{border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft)}
+  button{
+    border:0; border-radius:12px; padding:12px 22px; font:inherit; font-weight:600;
+    background:var(--accent); color:#fff; cursor:pointer; flex-shrink:0
+  }
+  button:disabled{opacity:.45; cursor:default}
+  /* ---------- 侧栏 ---------- */
+  aside{
+    width:310px; flex-shrink:0; background:var(--panel); border-left:1px solid var(--line);
+    overflow-y:auto; padding:16px
+  }
+  aside.hide{display:none}
+  .card{border:1px solid var(--line); border-radius:12px; padding:13px; margin-bottom:12px}
+  .card h2{
+    font-size:12.5px; margin:0 0 10px; color:var(--dim); font-weight:600;
+    letter-spacing:.06em; text-transform:uppercase; display:flex; align-items:center; gap:6px
+  }
+  .card h2 .n{margin-left:auto; text-transform:none; color:var(--ink); font-weight:600}
+  ul{margin:0; padding-left:17px}
+  li{margin:5px 0; font-size:13.5px}
+  .kv{display:flex; justify-content:space-between; font-size:13.5px; margin:5px 0}
+  .kv span:last-child{font-weight:600}
+  .bar{height:6px; background:#eef0f3; border-radius:4px; overflow:hidden; margin-top:3px}
+  .bar i{display:block; height:100%; background:var(--accent)}
+  .muted{color:var(--dim); font-size:13px}
+  .tag{
+    display:inline-block; font-size:11.5px; border-radius:6px; padding:1px 7px;
+    background:#f1f3f6; color:var(--dim); margin:2px 3px 0 0
+  }
+  .tag.on{background:var(--accent-soft); color:var(--accent)}
+  .tag.off{background:#fef2f2; color:var(--err)}
+  .tag.warn{background:#fffbeb; color:var(--warn)}
+  /* ---- API Key 设置卡片 ---- */
+  .keybox{margin-top:9px}
+  .keybox input{
+    width:100%; border:1px solid var(--line); border-radius:9px; padding:8px 10px;
+    font:13px/1.4 inherit; margin-bottom:7px; outline:none; background:#fff; color:var(--ink)
+  }
+  .keybox input:focus{border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft)}
+  .keybox .btnrow{display:flex; gap:8px; align-items:center}
+  .keybox button{
+    padding:8px 14px; font-size:13px; border-radius:9px; font-weight:500;
+    background:var(--accent); color:#fff; border:0; cursor:pointer
+  }
+  .keybox button.ghost{background:#fff; color:var(--dim); border:1px solid var(--line)}
+  .keybox button:disabled{opacity:.5; cursor:default}
+  .keymsg{font-size:12.5px; margin-top:8px; line-height:1.55}
+  .keymsg.ok{color:var(--ok)} .keymsg.bad{color:var(--err)} .keymsg.info{color:var(--dim)}
+  .warnbar{
+    background:#fffbeb; border:1px solid #fde68a; color:#92400e; border-radius:10px;
+    padding:10px 14px; font-size:13.5px; margin-bottom:14px; max-width:820px
+  }
+  #toggle{
+    position:absolute; top:14px; right:330px; z-index:5; background:#fff; color:var(--dim);
+    border:1px solid var(--line); padding:6px 11px; font-size:12px; border-radius:9px; font-weight:500
+  }
+  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--accent);
+        border-right-color:transparent;border-radius:50%;animation:s .7s linear infinite;vertical-align:-1px}
+  @keyframes s{to{transform:rotate(360deg)}}
+  @media (max-width:900px){ aside{display:none} #toggle{display:none} }
+</style>
+</head>
+<body>
+
+<main>
+  <header>
+    <h1 id="persona">小满</h1>
+    <span class="sub" id="subtitle">正在连接…</span>
+    <span id="conn"></span>
+  </header>
+
+  <div id="log">
+    <div class="tip">说点什么吧。她会记住你在意的事 —— 右侧能看到她记了什么。</div>
+  </div>
+
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="send">发送</button>
+  </div>
+</main>
+
+<button id="toggle">收起侧栏</button>
+<aside id="side"></aside>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $('#log'), input = $('#input'), send = $('#send'), side = $('#side');
+let busy = false;
+
+/* ---------- 渲染 ---------- */
+function esc(t){ return (t||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function addRow(who, text){
+  const me = who === 'me';
+  const row = document.createElement('div');
+  row.className = 'row' + (me ? ' me' : '');
+  row.innerHTML = `<div class="who">${me ? '你' : '满'}</div>
+    <div style="min-width:0"><div class="bubble">${esc(text)}</div>
+    <div class="meta"></div></div>`;
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  return row.querySelector('.meta');
+}
+
+function chip(meta, text, cls){
+  const c = document.createElement('span');
+  c.className = 'chip' + (cls ? ' ' + cls : '');
+  c.textContent = text;
+  meta.appendChild(c);
+}
+
+/* ---------- 状态栏 ---------- */
+function kv(label, val){
+  return `<div class="kv"><span>${label}</span><span>${val}</span></div>`;
+}
+function bar(pct){ return `<div class="bar"><i style="width:${Math.max(0,Math.min(100,pct))}%"></i></div>`; }
+
+/* ---------- API Key 设置 ---------- */
+let ENV = { configured:false, tail:'', base_url:'', model:'' };
+
+function renderKeyCard(){
+  const on = ENV.configured;
+  let h = `<div class="card"><h2>API Key<span class="n">${on ? '已配置' : '未配置'}</span></h2>`;
+  if(on){
+    h += `<div class="muted">当前：<b>····${esc(ENV.tail)}</b>`;
+    if(ENV.model) h += ` · ${esc(ENV.model)}`;
+    h += `</div>`;
+  } else {
+    h += `<div class="muted" style="color:var(--err)">还没有填 Key，聊天会失败。</div>`;
+  }
+  h += `<div class="keybox">
+      <input id="k-key" type="password" placeholder="${on ? '要换 Key 就填新的' : '粘贴你的 API Key（sk- 开头）'}" autocomplete="off">
+      <input id="k-url" placeholder="接口地址（可留空 = ${esc(ENV.base_url || 'https://api.deepseek.com')}）" value="" autocomplete="off">
+      <input id="k-model" placeholder="模型（可留空 = ${esc(ENV.model || 'deepseek-flash')}）" value="" autocomplete="off">
+      <div class="btnrow">
+        <button id="k-save">保存</button>
+        <button id="k-test" class="ghost">测试连接</button>
+      </div>
+      <div id="k-msg" class="keymsg info">保存在本机 <code>.env</code> 文件里（明文）。<b>不要把这个文件发给别人。</b></div>
+    </div></div>`;
+  return h;
+}
+
+function keyMsg(text, cls){
+  const el = document.getElementById('k-msg');
+  if(!el) return;
+  el.className = 'keymsg ' + (cls || 'info');
+  el.innerHTML = text;
+}
+
+async function loadEnv(){
+  try{
+    const r = await fetch('/api/env');
+    const d = await r.json();
+    if(d.ok){ ENV = d.env || ENV; }
+  }catch(e){}
+}
+
+async function saveKey(){
+  const key = (document.getElementById('k-key').value || '').trim();
+  const url = (document.getElementById('k-url').value || '').trim();
+  const model = (document.getElementById('k-model').value || '').trim();
+  const updates = {};
+  if(key) updates.LLM_API_KEY = key;
+  if(url) updates.LLM_BASE_URL = url;
+  if(model) updates.LLM_MODEL = model;
+  if(!Object.keys(updates).length){
+    keyMsg('什么都没填 —— 要改哪一项就填哪一项。', 'bad');
+    return;
+  }
+  const btn = document.getElementById('k-save');
+  btn.disabled = true; keyMsg('保存中…', 'info');
+  try{
+    const r = await fetch('/api/env', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({updates})
+    });
+    const d = await r.json();
+    if(!d.ok){ keyMsg('保存失败：' + esc(d.error || '未知错误'), 'bad'); return; }
+    ENV = d.env || ENV;
+    document.getElementById('k-key').value = '';
+    document.getElementById('k-url').value = '';
+    document.getElementById('k-model').value = '';
+    let msg = '已保存：' + esc((d.saved||[]).join('、')) + '。';
+    if(ENV.tail) msg += ` 当前 Key：····${esc(ENV.tail)}`;
+    if((d.errors||[]).length) msg += '<br>部分未保存：' + esc(d.errors.join('；'));
+    keyMsg(msg, 'ok');
+    await refreshStatus();
+  }catch(e){
+    keyMsg('连不上后端：' + esc(e.message), 'bad');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+async function testKey(){
+  const key = (document.getElementById('k-key').value || '').trim();
+  const btn = document.getElementById('k-test');
+  btn.disabled = true;
+  keyMsg('正在测……<b>这会花一点点钱</b>（一次极小的请求）。', 'info');
+  try{
+    const r = await fetch('/api/env/test', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(key ? {key} : {})
+    });
+    const d = await r.json();
+    if(d.ok){
+      keyMsg(`✅ 连上了。模型 <b>${esc(d.model||'')}</b>，用了 ${d.latency_ms ?? '?'} ms，` +
+             `它回了「${esc(d.reply||'')}」。`, 'ok');
+    } else {
+      keyMsg('❌ 没连上：' + esc(d.error || '未知错误'), 'bad');
+    }
+  }catch(e){
+    keyMsg('连不上后端：' + esc(e.message), 'bad');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+function renderStatus(st){
+  if(!st) return;
+  let h = '';
+
+  h += renderKeyCard();
+
+  const mem = st.memory || {};
+  h += `<div class="card"><h2>她记着的事<span class="n">${mem.count ?? 0} 条</span></h2>`;
+  if(mem.error){ h += `<div class="muted">读取失败：${esc(mem.error)}</div>`; }
+  else if(!mem.count){ h += `<div class="muted">还没有记忆版本。聊够之后跑一次 memory consolidate 生成。</div>`; }
+  else {
+    h += `<div class="muted" style="margin-bottom:6px">${esc(mem.version||'')}</div><ul>`;
+    (mem.items||[]).slice(0,12).forEach(it => h += `<li>${esc(it.text)}</li>`);
+    if((mem.items||[]).length > 12) h += `<li class="muted">…还有 ${mem.items.length-12} 条</li>`;
+    h += `</ul>`;
+  }
+  h += `</div>`;
+
+  const rel = st.relationship || {};
+  if(!rel.error){
+    h += `<div class="card"><h2>关系<span class="n">${esc(rel.stage||'—')}</span></h2>`;
+    [['信任',rel.trust],['亲近',rel.closeness],['熟悉',rel.familiarity]].forEach(([k,v]) => {
+      h += kv(k, (v??0).toFixed(1)) + bar(v||0);
+    });
+    h += `<div class="muted" style="margin-top:8px">互动事件 ${rel.total_events||0} 次`;
+    if(rel.counter_mode) h += ` · <span style="color:var(--warn)">当前处于 Counter Mode</span>`;
+    h += `</div></div>`;
+  }
+
+  const um = st.user_model || {};
+  if(!um.error){
+    h += `<div class="card"><h2>她眼中的你<span class="n">${um.active||0} 条</span></h2>`;
+    if(!(um.items||[]).length) h += `<div class="muted">还没形成判断。说点关于你自己的事试试。</div>`;
+    else {
+      h += `<ul>`;
+      (um.items||[]).forEach(x => {
+        const tag = x.status === 'confirmed' ? '明确说过' : '她的推断';
+        const cls = x.status === 'confirmed' ? 'on' : 'warn';
+        h += `<li><span class="tag ${cls}">${tag}</span> ${esc(x.belief)}</li>`;
+      });
+      h += `</ul>`;
+    }
+    if(um.superseded) h += `<div class="muted" style="margin-top:6px">另有 ${um.superseded} 条已被修正（保留可追溯）</div>`;
+    h += `</div>`;
+  }
+
+  const pend = st.pending || [];
+  if(pend.length){
+    h += `<div class="card"><h2>想说还没说<span class="n">${pend.length}</span></h2><ul>`;
+    pend.forEach(p => h += `<li>${esc(p.message)}<div class="muted">因为：${esc(p.reason)}</div></li>`);
+    h += `</ul></div>`;
+  }
+
+  const t = st.tools || {};
+  h += `<div class="card"><h2>工具<span class="n">${esc((t.permissions||[]).join('/'))}</span></h2>`;
+  if(t.error) h += `<div class="muted">读取失败：${esc(t.error)}</div>`;
+  else {
+    (t.enabled||[]).forEach(x => h += `<span class="tag on">${esc(x.name)}</span>`);
+    (t.blocked||[]).forEach(n => h += `<span class="tag off">${esc(n)}（权限未开）</span>`);
+  }
+  h += `</div>`;
+
+  const s = st.stats || {};
+  h += `<div class="card"><h2>累计</h2>`;
+  if(s.error) h += `<div class="muted">读取失败：${esc(s.error)}</div>`;
+  else {
+    h += kv('对话轮数', s.turns ?? 0)
+       + kv('原始事件', s.events ?? 0)
+       + kv('记忆版本', s.versions ?? 0)
+       + kv('API 调用', s.api_calls ?? 0)
+       + kv('累计花费', (s.cost_yuan ?? 0).toFixed(6) + ' 元');
+  }
+  h += `</div>`;
+
+  side.innerHTML = h;
+  // 卡片是重新渲染的，事件要重新绑
+  const save = document.getElementById('k-save');
+  const test = document.getElementById('k-test');
+  if(save) save.onclick = saveKey;
+  if(test) test.onclick = testKey;
+  // 侧栏顶部提示：没配 Key 时聊天必失败，得显眼
+  let wb = document.getElementById('warnbar');
+  if(!ENV.configured){
+    if(!wb){
+      wb = document.createElement('div');
+      wb.id = 'warnbar'; wb.className = 'warnbar';
+      log.parentElement.insertBefore(wb, log);
+    }
+    wb.innerHTML = '<b>还没有填 API Key</b>，现在聊天会失败。' +
+                   '在右边「API Key」卡片里粘贴你的 Key 并保存即可。';
+  } else if(wb){
+    wb.remove();
+  }
+}
+
+/* ---------- 后端 ---------- */
+async function refreshStatus(){
+  try{
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    if(d.ok){ renderStatus(d.status); $('#conn').textContent = ''; }
+    else { $('#conn').innerHTML = '<b style="color:var(--err)">状态读取失败</b>'; }
+  }catch(e){
+    $('#conn').innerHTML = '<b style="color:var(--err)">未连接</b>';
+  }
+}
+
+async function loadHistory(){
+  try{
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    if(!d.ok) return;
+    if((d.turns||[]).length){
+      log.innerHTML = '';
+      d.turns.forEach(t => {
+        if(t.user) addRow('me', t.user);
+        if(t.assistant) addRow('her', t.assistant);
+      });
+    }
+  }catch(e){}
+}
+
+async function sendText(){
+  const text = input.value.trim();
+  if(!text || busy) return;
+  busy = true; send.disabled = true;
+  input.value = ''; input.style.height = 'auto';
+  addRow('me', text);
+  const meta = addRow('her', '');
+  meta.innerHTML = '<span class="spin"></span> 正在想…';
+
+  try{
+    const r = await fetch('/api/chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if(!d.ok){
+      meta.innerHTML = '';
+      const e = document.createElement('div');
+      e.className = 'err'; e.textContent = '出错了：' + (d.error || '未知错误');
+      meta.parentElement.appendChild(e);
+    } else {
+      meta.parentElement.querySelector('.bubble').textContent = d.reply || '（空回复）';
+      meta.innerHTML = '';
+      // 工具调用 → 让你看见她真的用了工具，而不是黑箱
+      (d.tool_calls||[]).forEach(c => {
+        const bad = !c.ok;
+        chip(meta, `${c.ok ? '✓' : '✕'} ${c.name}`,
+             c.repeat ? 'warn' : (bad ? 'deny' : 'ok'));
+      });
+      if(d.tool_iterations > 1) chip(meta, `多步 ×${d.tool_iterations}`);
+      if(d.tool_truncated) chip(meta, '工具循环被截断', 'warn');
+      if(d.memory_hits) chip(meta, `召回记忆 ${d.memory_hits} 条`);
+      (d.relationship_events||[]).forEach(t => chip(meta, `关系：${t}`));
+      (d.user_model_changes||[]).forEach(c =>
+        chip(meta, c.type === 'revise' ? '修正了一条判断' : '记下一条判断'));
+      if(d.cost_yuan) chip(meta, `${d.cost_yuan.toFixed(6)} 元`);
+      if(d.status) renderStatus(d.status);
+    }
+  }catch(e){
+    meta.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'err'; el.textContent = '连不上后端：' + e.message;
+    meta.parentElement.appendChild(el);
+  }finally{
+    busy = false; send.disabled = false; input.focus();
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+/* ---------- 交互 ---------- */
+send.onclick = sendText;
+input.addEventListener('keydown', e => {
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(180, input.scrollHeight) + 'px';
+});
+$('#toggle').onclick = () => {
+  const hidden = side.classList.toggle('hide');
+  $('#toggle').textContent = hidden ? '展开侧栏' : '收起侧栏';
+  $('#toggle').style.right = hidden ? '14px' : '330px';
+};
+
+(async function init(){
+  // 顺序要紧：先取 env（API Key 状态），再渲染状态栏 ——
+  // 否则「API Key」卡片会先画成"未配置"，再跳成"已配置"。
+  await loadEnv();
+  await refreshStatus();
+  await loadHistory();
+  input.focus();
+  setInterval(refreshStatus, 15000);   // 侧栏定期刷新（花费/关系会变）
+})();
+</script>
+</body>
+</html>

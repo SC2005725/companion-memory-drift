@@ -1,0 +1,63 @@
+site_name: Companion · 关系型 AI 记忆偏移实验
+site_description: 一个关系型 AI Companion 的最小可用原型 —— 记忆、人格与关系如何共同塑造行为
+docs_dir: docs
+site_url: https://SC2005725.github.io/companion-memory-drift/
+site_dir: site
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切换到浅色
+
+nav:
+  - 首页: index.md
+  - 项目定位: project-spec.md
+  - 可行性分析: feasibility.md
+  - 项目报告: project-report.md
+  - 版本历史: version-history.md
+  - 实验记录:
+      - 实验日志: experiments/experiment-log.md
+      - 对比报告: experiments/comparison-report.md
+      - 实验前验证: experiments/pre-experiment-validation.md
+      - 基准事件候选: experiments/candidate-events.md
+      - 人工标注事实: experiments/ground-truth-facts.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search:
+      lang: zh
+
+# 站点不是产品文档，不追求全量
+strict: false

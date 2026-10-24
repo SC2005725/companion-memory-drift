@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-tests:
+    name: 离线自测（不需要 API Key，不花钱）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 准备占位 .env（自测不调用模型，只为让配置加载通过）
+        run: cp .env.example .env
+
+      - name: 跑离线自测
+        shell: bash
+        run: |
+          set -o pipefail
+          fail=0
+          for t in selftest_memory selftest_companion selftest_persona_state \
+                   selftest_merge selftest_tools selftest_router selftest_llm_exit \
+                   selftest_p0_capture selftest_p2_conflict selftest_memory_source; do
+            echo "=================== $t ==================="
+            if ! python "src/$t.py"; then
+              echo "::error::$t 失败"
+              fail=1
+            fi
+          done
+          echo "=================== dryrun ==================="
+          if ! python src/dryrun.py; then
+            echo "::error::dryrun 失败"
+            fail=1
+          fi
+          exit $fail
+
+      - name: 确认没有运行期数据被写进仓库
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::warning::工作区有未跟踪改动，请检查 .gitignore"
+            git status --porcelain
+          fi

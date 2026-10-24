@@ -1,0 +1,33 @@
+Companion · Memory-Drift Experiment
+Copyright 2026 The Companion Memory-Drift Experiment Authors
+
+This product includes software developed as part of the
+"Companion / memory-drift" experiment.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+第三方依赖说明
+
+本项目运行时只依赖以下两个第三方包（见 requirements.txt）：
+
+  * openai        — MIT License
+                    https://github.com/openai/openai-python
+  * python-dotenv — BSD-3-Clause License
+                    https://github.com/theskumar/python-dotenv
+
+文档站构建（仅 CI 使用，非运行时依赖，见 requirements-docs.txt）：
+
+  * mkdocs-material — MIT License
+                      https://github.com/squidfunk/mkdocs-material
+
+--------------------------------------------------------------------------------
+数据说明
+
+本仓库**不包含任何真实对话、记忆或用户模型数据**。
+conversation/ memory/ user_model/ self_model/ relationship/ logs/ 均已加入
+.gitignore，它们装的是使用者自己的数据，首次运行时由程序创建。

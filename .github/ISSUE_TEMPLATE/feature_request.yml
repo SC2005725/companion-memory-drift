@@ -1,0 +1,43 @@
+name: 提出建议
+description: 有想法或想讨论设计
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提建议前请先读
+        [CONTRIBUTING.md](https://github.com/) 里的五条硬约束 ——
+        本项目**刻意为可解释性牺牲了智能度**，违反这些约束的建议会被请回。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决的实际问题
+      description: 描述问题本身，不要先描述方案
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你的想法
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoff
+    attributes:
+      label: 代价与副作用
+      description: |
+        会新增依赖吗？会增加每次对话的模型调用吗？会让某条判定从"可复现"变成"看模型心情"吗？
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 属于哪一层
+      options:
+        - 基础设施（记忆 / 关系 / 存储 / 工具）
+        - 她作为一个人的内部模型（人格 / 自我认知 / 动机）
+        - 动态进化（经历如何改变她）
+        - 文档 / 工程
+    validations:
+      required: true

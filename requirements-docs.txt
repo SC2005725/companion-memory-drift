@@ -1,0 +1,2 @@
+# 仅用于构建 GitHub Pages 文档站（CI 使用），**不是运行时依赖**。
+mkdocs-material>=9.5,<10

@@ -1,0 +1,39 @@
+# ============ 密钥：绝对不要提交 ============
+.env
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============ 运行期数据：含真实记忆与对话，一律不进版本库 ============
+# 这些目录里是**使用者自己的**记忆、对话与模型状态。
+# 克隆者第一次运行时由程序自行创建。
+conversation/
+memory/versions/
+memory/changelog/
+memory/raw/
+user_model/
+self_model/
+relationship/
+notes/
+recall/
+logs/
+
+# ============ 其它 ============
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.DS_Store
+Thumbs.db
+
+# �浵ê�㣺ָ��ê��ʱ����ʵ���ģ����¡��û����Щ���ݣ����ϻ��� verify ��
+experiments/first_archive.json
+
+
+# �ĵ�վ�������CI ���ɣ�����⣩
+site/
+

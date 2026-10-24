@@ -1,0 +1,59 @@
+name: 报告问题
+description: 有东西没按预期工作
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        谢谢反馈。**请先确认：不要在 issue 里粘贴 API Key、真实对话或记忆内容。**
+  - type: textarea
+    id: what
+    attributes:
+      label: 实际发生了什么
+      description: 贴出真实输出，不要写"应该是"
+    validations:
+      required: true
+  - type: textarea
+    id: expect
+    attributes:
+      label: 你期望发生什么
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 具体的命令与参数
+      placeholder: |
+        1. python src/main.py ui
+        2. 输入「...」
+        3. 看到 ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - 记忆（整理 / 检索 / 分类 / 分层）
+        - 关系
+        - 人格 / 自我模型
+        - 用户模型
+        - 心跳 / 主动性
+        - 工具层
+        - 其它
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: git rev-parse --short HEAD 的输出
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 请先删除其中的个人信息
+      render: text

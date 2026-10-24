@@ -1,0 +1,4 @@
+# Phase 1-3 只需要两个依赖，刻意保持最小。
+# OpenAI 兼容 API 也可用 requests 手写，此处用官方 SDK 以减少出错面。
+openai>=1.40.0
+python-dotenv>=1.0.0
