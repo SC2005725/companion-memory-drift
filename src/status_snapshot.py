@@ -66,6 +66,9 @@ SELFTESTS = [
     ("selftest_llm_exit.py", "Phase 11 统一 LLM 出口（doctor / webui 记账）",
      ["src/selftest_llm_exit.py"]),
     ("selftest_router.py", "Phase 10 模型路由", ["src/selftest_router.py"]),
+    # ★ 2026-10-25 补入：这个套件此前**完全没进快照**，46 项成绩一直不可见。
+    ("selftest_persona_state.py", "人格状态 / 偏好演化 / 快照语义",
+     ["src/selftest_persona_state.py"]),
     ("dryrun.py", "全流程演练（在副本上跑）", ["src/dryrun.py"]),
 ]
 
@@ -78,6 +81,11 @@ DB_TABLES = [
     ("user_model_events", "用户模型事件"),
     ("tool_calls", "工具调用（含自测）"),
     ("api_calls", "API 调用"),
+    # ★ 2026-10-25 补入：这三张表是「主动性 / P0 留痕」的**唯一证据来源**，
+    #   此前不在快照里，导致「心跳跑过几次」「主动消息发过几条」无从查看。
+    ("heartbeat_runs", "心跳运行"),
+    ("pending_actions", "待处理意向（主动消息）"),
+    ("concern_injections", "关注点留痕 P0（injected=1 才算真的进过上下文）"),
 ]
 
 
@@ -169,6 +177,68 @@ def tool_stats() -> dict:
     }
 
 
+def unverified_checks() -> dict:
+    """自动检查「未验证能力」的**客观状态**。
+
+    ## ⚠️ 本函数只报告**可观察事实**
+
+    按 AGENTS.md 第六部分确立的纪律：
+    **「没有触发」是可观察事实；「因此链路坏了」是需要额外证据的判断。**
+
+    所以这里只回答「有没有」 ——
+    **不输出「正常」「异常」「失败」这类结论**，判断留给读者。
+
+    ## 为什么放进快照
+
+    此前这四项的状态**只写在散文里**，没有可核对的数字。
+    结果是「情绪写入从未触发」这件事**在状态文件里看不到**，
+    只能靠人记得。加进来之后，重跑一次就能看到它是空的还是不为空。
+    """
+    out: dict = {}
+
+    # 1) 情绪持久化 —— 写入链路的唯一物证
+    emo = ROOT / "emotion"
+    out["emotion_files"] = (
+        len([p for p in emo.iterdir() if p.is_file()]) if emo.is_dir() else 0
+    )
+
+    # 2) 人格发展闭环 —— provisional 是否出现过
+    prof = ROOT / "personality" / "profile.json"
+    out["profile_provisional"] = None
+    if prof.is_file():
+        try:
+            data = json.loads(prof.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                out["profile_provisional"] = "provisional" in data
+            elif isinstance(data, list):
+                out["profile_provisional"] = any(
+                    isinstance(x, dict) and "provisional" in x for x in data
+                )
+        except (json.JSONDecodeError, OSError):
+            out["profile_provisional"] = None
+
+    # 3) 模型适配层是否启用（读源码，不 import，避免副作用）
+    out["model_adapter_enabled"] = None
+    for f in ("heartbeat.py", "config.py", "model_adapter.py", "chat.py"):
+        p = SRC / f
+        if not p.is_file():
+            continue
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("MODEL_ADAPTER") and "=" in s:
+                rhs = s.split("=", 1)[1].split("#")[0].strip()
+                out["model_adapter_enabled"] = rhs not in ("None", "none")
+                break
+        if out["model_adapter_enabled"] is not None:
+            break
+
+    # 4) 图片 —— 多模态真实使用次数
+    up = ROOT / "uploads"
+    out["uploads"] = len([p for p in up.iterdir() if p.is_file()]) if up.is_dir() else 0
+
+    return out
+
+
 def ledger_total() -> str:
     path = ROOT / "logs" / "ledger.jsonl"
     if not path.exists():
@@ -191,6 +261,7 @@ def main() -> int:
     counts = db_counts()
     tools = tool_stats()
     cost = ledger_total()
+    unv = unverified_checks()
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
 
     L = []
@@ -265,6 +336,28 @@ def main() -> int:
     A("")
     A("---")
     A("")
+    A("## 未验证能力的客观状态（**只报事实，不下结论**）")
+    A("")
+    A("| 能力 | 观察点 | 当前 | 算「验证通过」的证据 |")
+    A("|------|--------|------|---------------------|")
+    _ef = unv.get("emotion_files")
+    A(f"| **情绪持久化** | `emotion/` 文件数 | **{_ef}** | 某次整理后 `emotion/` "
+      "**自己**出现文件，且 residue 里 `event_refs` 对得上真实发生过的事 |")
+    _pp = unv.get("profile_provisional")
+    _ppt = {True: "**有**", False: "**无**", None: "无法判定"}.get(_pp, "无法判定")
+    A(f"| **人格发展闭环** | `profile.json` 有 `provisional` | {_ppt} | "
+      "`profile.json` 自己出现 `provisional`，且 `challenged` 是用户说过的话 |")
+    _ma = unv.get("model_adapter_enabled")
+    _mat = {True: "已启用", False: "**未启用**", None: "无法判定"}.get(_ma, "无法判定")
+    A(f"| **模型适配层** | 源码里的 `MODEL_ADAPTER` | {_mat} | 实际接管过一次调用 |")
+    A(f"| **图片多模态** | `uploads/` 文件数 | **{unv.get('uploads')}** | 真实对话里用过并正确识别 |")
+    A("")
+    A("> ⚠️ **本表只回答「有没有」。** 按底层设定：**「没有触发」是可观察事实**，")
+    A("> **「因此链路坏了」是需要额外证据的判断** —— 两者不可混为一谈。")
+    A("> 判据原文：**若长期仍是空的，不是「还没到」，是链路有问题，那时回来查。**")
+    A("")
+    A("---")
+    A("")
     A("## 定性状态（这些不随对话变化，手写维护）")
     A("")
     A("| Phase | 内容 | 状态 |")
@@ -286,7 +379,7 @@ def main() -> int:
     A("Phase 10 如实说明 —— **这一期没有产生成本收益**：")
     A("")
     A("```")
-    A("所有 155 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）")
+    A(f"所有 {counts.get('api_calls')} 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）")
     A("→ 「简单任务用便宜模型」没有更便宜的可用 → 省 0 元")
     A("→ 若把复杂任务送去 deepseek-v4-pro，反而贵 4.5 倍")
     A("```")
