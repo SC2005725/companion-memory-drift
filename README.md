@@ -4,7 +4,24 @@
   简体中文 · <a href="./README_EN.md">English</a>
 </p>
 
-# 共生 · 关系型 AI 记忆偏移实验
+# 共生 Companion
+
+**一个探索 AI 长期陪伴的开源工程项目。**
+
+共生（Companion）尝试通过**可追溯的长期记忆、关系状态与持续互动机制**，
+让 AI 的回应能够结合共同经历，并研究这些机制如何影响它后续的表达与行为。
+
+> **项目起源与设计假设**
+>
+> 共生最初源于对「关系型 AI 长期互动与记忆变化」的探索 ——
+> 给一个 AI 初始人格和有限过去，让它长期和一个人相处，它能否逐渐长出
+> 属于自己的记忆、判断与行为。
+>
+> **那个问题意识仍然是起点，但项目已不只是那个实验。**
+> 现在它是一个围绕长期记忆、关系状态与持续互动机制展开的 AI 陪伴系统工程 ——
+> 记忆、关系、人格、用户模型、自我模型与情绪各自成为**可运行、可测试、可追踪**的模块。
+> 最初的设想与后来被工程实践修正的地方，记录在
+> [`docs/feasibility.md`](docs/feasibility.md)。
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)

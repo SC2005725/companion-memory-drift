@@ -1,5 +1,5 @@
-site_name: Companion · 关系型 AI 记忆偏移实验
-site_description: 一个关系型 AI Companion 的最小可用原型 —— 记忆、人格与关系如何共同塑造行为
+site_name: 共生 Companion
+site_description: 探索 AI 长期陪伴的开源工程项目 —— 可追溯的长期记忆、关系状态与持续互动机制如何影响 AI 的表达与行为
 docs_dir: docs
 site_url: https://SC2005725.github.io/companion-memory-drift/
 site_dir: site
@@ -30,6 +30,8 @@ theme:
 
 nav:
   - 首页: index.md
+  - 系统架构: architecture.md
+  - 开发路线: roadmap.md
   - 项目定位: project-spec.md
   - 可行性分析: feasibility.md
   - 项目报告: project-report.md
