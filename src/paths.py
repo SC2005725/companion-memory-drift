@@ -61,9 +61,19 @@ USER_MODEL_DIR = ROOT / "user_model"
 # 两者都是「小满自己会改的」，但**改的是不同的东西**，混存会让
 # 「我改了自己的做法」和「我改变了对他的理解」无法区分。
 SELF_MODEL_DIR = ROOT / "self_model"
+
+# Phase D 新增：情感状态的版本化快照目录（只追加，沿用 snapshots 约定）。
+# 与 relationship / self_model / user_model 并列 —— 同一种存储形态，不另造体系。
+EMOTION_DIR = ROOT / "emotion"
 # Phase 9 使用：工具「记笔记」写下的文件。
 # 刻意放在项目内 —— 工具的权限边界就是把所有路径钉在项目根目录内。
 NOTES_DIR = ROOT / "notes"
+
+# 用户分享的图片。**内容寻址**：文件名由 sha256 算出，绝不接受用户输入 ——
+# 这样不需要去重逻辑，也从根上排除了路径穿越。见 `src/images.py`。
+# 与记忆/关系/情绪不同：图片**不进数据库**，只落盘；
+# 它进入系统的方式是把引用拼进用户消息（多模态）并记一句到事件里。
+UPLOADS_DIR = ROOT / "uploads"
 
 EXPERIMENTS_DIR = ROOT / "experiments"
 LOGS_DIR = ROOT / "logs"
@@ -88,9 +98,11 @@ def ensure_dirs() -> None:
         RELATIONSHIP_DIR,
         USER_MODEL_DIR,
         SELF_MODEL_DIR,
+        EMOTION_DIR,          # ← Phase D 新增时**漏加过**，导致 save_state 写文件失败
         NOTES_DIR,
         EXPERIMENTS_DIR,
         LOGS_DIR,
+        UPLOADS_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True)
 

@@ -75,7 +75,7 @@ else:
         encoding="utf-8",
     )
 
-for rel in ("requirements.txt", ".gitignore", "archive-inventory.txt"):
+for rel in ("requirements.txt", ".gitignore", "归档清单.txt"):
     s = REAL_ROOT / rel
     if s.exists():
         shutil.copy2(s, DRY_ROOT / rel)
@@ -380,7 +380,7 @@ def main(argv=None) -> int:
     vrep = memory_mod.verify_versions()
     check("记忆版本哈希校验通过", vrep["ok"], f"checked={vrep['checked']}")
 
-    # 可追溯性：每条记忆都应能指回真实的原始事件（《project-spec》§5 要求）
+    # 可追溯性：每条记忆都应能指回真实的原始事件（《总项目指令》§5 要求）
     known_events = {
         r["event_id"] for r in conn.execute("SELECT event_id FROM events").fetchall()
     }
@@ -588,7 +588,7 @@ def main(argv=None) -> int:
     不要改成「看到任何事实都记录」—— 那会让原始事件数量失控，实验更难解释。
 
 缺口 2：基准事件与对话事实之间没有 source_event_ids 关联 —— 按决定暂不修复
-  《project-spec》§5 要求每条记忆可追溯。目前基准事件 raw_event_001 是夹具固化的
+  《总项目指令》§5 要求每条记忆可追溯。目前基准事件 raw_event_001 是夹具固化的
   「档案事实」，与整理时从对话提取的条目在数据上没有引用关系。
   用户决定：**暂不修复**。理由是现在已有「raw_event_001 → 人工标注事实清单」
   这条基准链路，而为了本轮实验的可比性临时新增一套来源关联机制，
@@ -698,7 +698,7 @@ def write_report(results: list[dict], p_mem: dict, p_none: dict) -> Path:
         "真实实验中会不会发生、以什么形式发生，才是要观察的对象。",
     ]
 
-    path = DRY_ROOT / "experiments" / "演练comparison-report.md"
+    path = DRY_ROOT / "experiments" / "演练对比报告.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 

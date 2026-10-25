@@ -1,6 +1,6 @@
 """模型路由（Phase 10）。
 
-对应《project-spec》§11「Model Router」与 §31「Phase 10」。
+对应《总项目指令》§11「Model Router」与 §31「Phase 10」。
 
 ## 规范原话的意图
 

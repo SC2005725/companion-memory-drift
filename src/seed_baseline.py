@@ -11,7 +11,7 @@
 走聊天做不到这三点：聊天会生成随机 turn_id、随机 event_id，还会因对话上下文不同
 而产生不同的原始事件文本。所以基准事件从**受控定义文件**固化：
 
-    experiments/baseline-event.json
+    experiments/raw_event_001-选定的基准事件.json
 
 同时从同一份定义生成人工标注事实清单 —— 两处内容同源，不会互相漂移。
 
@@ -29,8 +29,8 @@ import json
 import storage
 from paths import EXPERIMENTS_DIR, RAW_EVENTS_DIR
 
-FIXTURE_FILE = EXPERIMENTS_DIR / "baseline-event.json"
-CHECKLIST_FILE = EXPERIMENTS_DIR / "ground-truth-facts.md"
+FIXTURE_FILE = EXPERIMENTS_DIR / "raw_event_001-选定的基准事件.json"
+CHECKLIST_FILE = EXPERIMENTS_DIR / "人工标注事实清单.md"
 
 
 class SeedError(RuntimeError):
@@ -84,7 +84,7 @@ def seed(conn, *, force: bool = False) -> dict:
         "keywords_configured": [],
         "matched": [],
         "hit": False,
-        "note": "基准事件由 experiments/baseline-event.json 固化，"
+        "note": "基准事件由 experiments/raw_event_001-选定的基准事件.json 固化，"
                 "不经过关键词触发规则，因此 matched 为空。",
     }
 
@@ -120,7 +120,7 @@ def write_checklist(fx: dict) -> str:
         "# 人工标注事实清单（基准答案）",
         "",
         "> 本文件由 `src/seed_baseline.py` 从",
-        "> `experiments/baseline-event.json` **自动生成**，请勿手工编辑 ——",
+        "> `experiments/raw_event_001-选定的基准事件.json` **自动生成**，请勿手工编辑 ——",
         "> 要改内容请改那份定义文件，然后重新执行 `python src\\main.py seed-baseline --force`。",
         "",
         f"- 基准事件：`{fx['event_id']}`",

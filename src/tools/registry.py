@@ -1,6 +1,6 @@
 """工具注册表与调用入口（Phase 9）。
 
-project-spec §10：Companion Core 只依赖 `Tool` 接口，不依赖任何具体平台。
+总项目指令 §10：Companion Core 只依赖 `Tool` 接口，不依赖任何具体平台。
 换平台 = 换注册表里的实现，Core 一行不改。
 """
 

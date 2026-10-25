@@ -1,6 +1,6 @@
 """工具接口（Phase 9）。
 
-对应《project-spec》§10「Tool / Plugin Layer」与 §30「Phase 9 Tools」。
+对应《总项目指令》§10「Tool / Plugin Layer」与 §30「Phase 9 Tools」。
 
 ## 核心约束：Core 不被工具平台绑死
 

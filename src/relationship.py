@@ -1,10 +1,10 @@
 """关系状态系统（Phase 6）。
 
-对应《project-spec》§4「关系模型」与 §27「Phase 6 Relationship」。
+对应《总项目指令》§4「关系模型」与 §27「Phase 6 Relationship」。
 
 ## 核心设计：状态从事件流推导，不是累加出来的
 
-project-spec明确禁止这种写法：
+总项目指令明确禁止这种写法：
 
     今天第 100 天 → 好感度 +1
 
@@ -45,7 +45,12 @@ import math
 from datetime import datetime
 
 from paths import RELATIONSHIP_DIR, ensure_dirs
+import snapshots
 import storage
+
+# 快照文件名前缀。三个模块共用 `snapshots` 的通用逻辑，
+# 差异（目录 / 前缀 / 撞号策略）由各自显式传入。
+_SNAP_PREFIX = "state_v"
 
 # 各类型事件的「关系权重」。用于推导数值，不是计数器。
 WEIGHTS = {
@@ -196,33 +201,34 @@ def derive_state(events: list[dict], rules: dict | None = None) -> dict:
 # ----------------------------------------------------------------------------
 
 def snapshot_path(version: int):
-    return RELATIONSHIP_DIR / f"state_v{version:03d}.json"
+    return snapshots.path_for(RELATIONSHIP_DIR, _SNAP_PREFIX, version)
 
 
 def existing_snapshots() -> list[int]:
-    ensure_dirs()
-    out = []
-    for path in RELATIONSHIP_DIR.glob("state_v*.json"):
-        stem = path.stem  # state_v001
-        try:
-            out.append(int(stem.split("_v")[1]))
-        except (IndexError, ValueError):
-            continue
-    return sorted(out)
+    return snapshots.scan_versions(RELATIONSHIP_DIR, prefix=_SNAP_PREFIX, ensure=True)
 
 
 def next_snapshot_version() -> int:
-    versions = existing_snapshots()
-    return (versions[-1] + 1) if versions else 1
+    return snapshots.next_version(existing_snapshots())
 
 
 def save_snapshot(state: dict, *, note: str = "") -> dict:
-    """把状态快照落盘。**已存在则抛错，绝不覆盖。**"""
+    """把状态快照落盘。**已存在则抛错，绝不覆盖。**
+
+    版本号与撞号判定改由 `snapshots.resolve_version` 统一处理。
+    relationship 的策略是 **`seek=False`（撞号即拒绝）** —— 与 self_model /
+    user_model 的"往后找空号"不同，这一差异**显式通过参数传入**，不隐藏。
+    """
     ensure_dirs()
-    version = next_snapshot_version()
-    path = snapshot_path(version)
-    if path.exists():
+    version, path, status = snapshots.resolve_version(
+        RELATIONSHIP_DIR, prefix=_SNAP_PREFIX, seek=False
+    )
+    if status == "collision":
         raise RelationshipError(f"关系状态快照已存在，拒绝覆盖：{path.name}")
+    if status == "exhausted":  # 理论上不可达（seek=False 会先返回 collision）
+        raise RelationshipError(
+            f"连续 {snapshots.SCAN_LIMIT} 个快照号被占用：{path.name}"
+        )
 
     payload = {
         "version": f"v{version:03d}",

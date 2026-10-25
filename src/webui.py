@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+
+# 图片引用只可能是我们自己算出来的内容寻址名。挡在这里，也挡在 images.load_image。
+_IMAGE_NAME_RE = re.compile(r"^[0-9a-f]{16}\.(png|jpg|gif|webp|bmp)$")
 import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 SRC = Path(__file__).resolve().parent
 ROOT = SRC.parent
@@ -250,7 +254,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/env":
             self._env_status()
             return
+        # 图片回显：`<img src="/uploads/<name>">`
+        if path.startswith("/uploads/"):
+            self._image_serve(path[len("/uploads/"):])
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _image_serve(self, name: str) -> None:
+        """回显一张已存的图。**名字不合规或不存在就是 404**，不回退到别的路径。"""
+        import images
+        try:
+            data, mime = images.load_image(unquote(name))
+        except images.ImageError as exc:
+            self._send(404, str(exc).encode("utf-8"), "text/plain; charset=utf-8")
+            return
+        # 图片内容按 sha256 命名 → 内容变了名字就变，所以可以长期缓存
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _route_post(self) -> None:
         path = urlparse(self.path).path
@@ -263,7 +290,51 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/env/test":
             self._env_test()
             return
+        if path == "/api/upload":
+            self._upload()
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _upload(self) -> None:
+        """收一张图，存盘，返回内容寻址的名字。
+
+        **只做存储，不碰数据库、不写记忆** ——
+        图片进入系统靠的是下一轮 `send_once(user_image=...)`，
+        以及事件里记一句「分享了一张图片」。这样 schema 零变化。
+
+        `_read_json` 的请求体上限是 1MB，base64 后对应约 750KB 原图；
+        前端会先在 canvas 里缩到长边 1600 再传，正常远低于这个数。
+        """
+        import base64
+        import binascii
+        import images
+
+        payload = self._read_json()
+        if not isinstance(payload, dict):
+            self._json({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+            return
+        b64 = payload.get("data")
+        if not isinstance(b64, str):
+            self._json({"ok": False, "error": "data 必须是 base64 字符串"}, 400)
+            return
+        # 去掉可能存在的 data URI 前缀
+        if b64.startswith("data:"):
+            comma = b64.find(",")
+            if comma < 0:
+                self._json({"ok": False, "error": "data URI 不完整"}, 400)
+                return
+            b64 = b64[comma + 1:]
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            self._json({"ok": False, "error": "base64 解码失败"}, 400)
+            return
+        try:
+            info = images.save_image(raw)
+        except images.ImageError as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        self._json({"ok": True, "image": info})
 
     # -- API Key 设置（唯一会写密钥的地方）------------------------------------
 
@@ -430,7 +501,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "text 必须是字符串"}, 400)
             return
         text = raw_text.strip()
-        if not text:
+
+        # 图片：可以只发图不打字，所以"空消息"的判定要放宽。
+        # 名字必须是我们自己算出来的那种（内容 sha256）—— `images.load_image` 会再验一次，
+        # 这里先挡一道，避免把任意字符串传下去。
+        raw_image = payload.get("image")
+        image = raw_image.strip() if isinstance(raw_image, str) else None
+        if image is not None and not _IMAGE_NAME_RE.match(image):
+            self._json({"ok": False, "error": "非法的图片引用"}, 400)
+            return
+
+        if not text and not image:
             self._json({"ok": False, "error": "空消息"}, 400)
             return
         if len(text) > 8000:
@@ -444,7 +525,8 @@ class Handler(BaseHTTPRequestHandler):
             conn = storage.connect()
             try:
                 session, settings = _make_session(conn)
-                result = chat.send_once(session, text, echo=lambda *_: None)
+                result = chat.send_once(session, text, echo=lambda *_: None,
+                                        user_image=image)
                 turn = result.get("turn") or {}
                 try:
                     status = collect_status(conn, settings)

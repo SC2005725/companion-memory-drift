@@ -3,7 +3,7 @@
 职责：
     记忆条目的数据结构 → 版本快照落盘（只增不改）→ 关键词检索
 
-三条硬约束（来自《project-spec》与 docs 的 P0 风险清单）：
+三条硬约束（来自《总项目指令》与 docs 的 P0 风险清单）：
 
 1. **版本永不覆盖**：v001.json 写好后，v002 是一个新文件，绝不修改 v001。
    目录里同时存在 v1/v2/v3 完整快照，可独立打开对比。
@@ -27,6 +27,40 @@ from paths import VERSIONS_DIR, ensure_dirs
 
 # 证据等级。推断不得伪装成事实。
 VALID_TYPES = ("FACT", "INFERENCE", "UNKNOWN")
+
+# ---------------------------------------------------------------------------
+# B1：记忆**来源**标记（remembered / reconstructed / inferred）
+# ---------------------------------------------------------------------------
+#
+# 与既有 `type` 的分工（**刻意不重复造**）：
+#
+#   type       认识论性质：FACT / INFERENCE / UNKNOWN —— 整理时判定「这是不是事实」
+#   provenance 记忆**来源**：这条是怎么来的 —— 记得的 / 重建的 / 推断的
+#
+# 两者相关但不等价：一条 FACT 也可能是**重建**出来的（用户说过大意，措辞是拼的）。
+#
+# **优先复用既有机制**：未显式标注时，由 `type` 直接派生，
+# 所以 v001–v010 的历史条目**不需要任何迁移**，读回来就有合理来源。
+PROVENANCE_REMEMBERED = "remembered"        # 用户明确说过 / 原始事件直接支撑
+PROVENANCE_RECONSTRUCTED = "reconstructed"  # 由片段 + 情境重建，不是逐字记得
+PROVENANCE_INFERRED = "inferred"            # 系统推断出来的
+PROVENANCES = (PROVENANCE_REMEMBERED, PROVENANCE_RECONSTRUCTED, PROVENANCE_INFERRED)
+
+_TYPE_TO_PROVENANCE = {
+    "FACT": PROVENANCE_REMEMBERED,
+    "INFERENCE": PROVENANCE_INFERRED,
+    # UNKNOWN → None：不知道就是不知道，不硬塞一个来源
+}
+
+# 注入时对「非亲历」来源的显式提醒。
+#
+# 为什么不能用英文 tag 了事：`[INFERENCE]` 在中文语境里信号太弱，
+# 模型很容易把它当成事实陈述讲出去 —— 而那正是要防的「把推断当事实」。
+# 所以这里用整句中文，直接说明**它不是用户说过的话**。
+_PROVENANCE_CAVEAT = {
+    PROVENANCE_INFERRED: "这是你自己的推测，不是用户说过的话，别当事实讲",
+    PROVENANCE_RECONSTRUCTED: "这是你拼出来的印象，不是逐字记得，说的时候要留余地",
+}
 
 # ----------------------------------------------------------------------------
 # Memory V1：分类 / 分层 / 衰减
@@ -240,7 +274,7 @@ def decay_factor(item: "MemoryItem", now=None) -> float:
     return floored + (1.0 - floored) * s
 
 
-def importance(item: "MemoryItem", now=None) -> float:
+def importance(item: "MemoryItem", now=None, *, recall_count: int | None = None) -> float:
     """综合重要性 ∈ [0, 1] —— 决定检索优先级。
 
     组成（借鉴 Hindsight 的「重要性/时效/召回价值」加权）：
@@ -253,10 +287,19 @@ def importance(item: "MemoryItem", now=None) -> float:
     conf = 0.6 if item.confidence is None else float(item.confidence)
     base = 0.5 * conf + 0.5 * decay_factor(item, now=now)
 
-    # 召回价值：被用过最多加到 +0.15（对数，避免刷次数）
+    # 召回价值：被用过最多加到 +0.15（对数，避免刷次数）。
+    #
+    # B3：`recall_count` 参数优先。记忆版本是**不可变的**（改了 sha256 就废了），
+    # 所以真实召回次数不能就地累加，只能由 `retrievals` 表**派生**后传进来
+    # （见 storage.count_item_recalls）。
+    #
+    # 量级刻意压得很小：即使被召回一百次也只加 0.15，
+    # 而排序里 importance 还乘 0.3（见 retrieve.rank）→ 净影响最多 +0.045。
+    # **既不会压过相关性，也不可能绕过隐私边界。**
     import math
-    if item.recall_count:
-        base += min(0.15, 0.05 * math.log1p(item.recall_count))
+    rc = item.recall_count if recall_count is None else recall_count
+    if rc:
+        base += min(0.15, 0.05 * math.log1p(rc))
 
     base += 0.15 * max(0.0, min(1.0, float(item.salience or 0.0)))
 
@@ -387,6 +430,10 @@ class MemoryItem:
     created_at: str | None = None
     updated_at: str | None = None
 
+    # B1 新增：来源标记。**默认 None → 由既有 type 派生**，
+    # 所以历史版本 JSON 里没有这个字段也能读回合理来源，不需要迁移。
+    provenance: str | None = None
+
     def __post_init__(self) -> None:
         self.type = (self.type or "UNKNOWN").upper()
         if self.type not in VALID_TYPES:
@@ -412,6 +459,13 @@ class MemoryItem:
         except (TypeError, ValueError):
             self.recall_count = 0
 
+        # B1：来源标记。显式给了非法值 → 丢掉重派生（不静默留脏值）；
+        # 没给 → 由既有 type 派生。**复用机制，不加任何判定调用。**
+        if self.provenance is not None and self.provenance not in PROVENANCES:
+            self.provenance = None
+        if self.provenance is None:
+            self.provenance = _TYPE_TO_PROVENANCE.get(self.type)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -434,6 +488,7 @@ class MemoryItem:
             archived_reason=data.get("archived_reason"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+            provenance=data.get("provenance"),
         )
 
 
@@ -498,6 +553,66 @@ def next_version_name() -> str:
 
 def version_path(version: str):
     return VERSIONS_DIR / f"{version}.json"
+
+
+# ---------------------------------------------------------------------------
+# B16：不可违反的约束 —— 记忆只追加
+# ---------------------------------------------------------------------------
+#
+# 这几条**不是实现习惯，是不许违反的规则**。
+#
+# 原来它们只是「我们一直这么做」：save_version 恰好拒绝覆盖、
+# promote_tiers 恰好只降权不删除 —— 但没有任何东西拦得住
+# 「哪天为了性能直接删条目」。
+#
+# 与卷三「意识封存」同源：**必须可逆！不删除自己！保留身份和记忆！**
+INVARIANTS = (
+    "记忆版本只追加：save_version 遇到同名文件必须抛错，绝不覆盖。",
+    "**取代必须留痕**：旧条目 id 可以从新版本消失（历史在上一版文件里），"
+    "但必须对得上模型显式声明的 replaces / deletes —— 静默丢失是违规。",
+    "被取代的条目在**仍在 items 里时**标 superseded_by 与 archived_reason。",
+    "归档（archive）是降权与隔离，不是删除；archived_reason 必须写明理由。",
+    "模型没提到的旧条目按「保留」处理：漏写 ≠ 删除指令。",
+)
+
+
+class InvariantViolation(MemoryError):
+    """违反 append-only 约束。**刻意继承 MemoryError，且不应被静默吞掉。**"""
+
+
+def enforce_traceable_removal(
+    before_ids,
+    after_ids,
+    *,
+    accounted,
+    version: str = "",
+) -> None:
+    """B16 强制执行点：**消失的旧条目必须留痕**。
+
+    ## 为什么刻意**不**要求「id 永不消失」
+
+    这是实测踩过的坑。初版曾把被取代的旧条目 append 回新版本，想「保留历史」；
+    结果新版本里新旧条目并存 → `changelog.diff` 把旧条目看成 **unchanged** →
+    **漂移检测（modified/reworded）全部变 0**，而漂移检测是本实验的核心功能。
+
+    所以正确设计是：**历史保存在上一版文件里**（版本快照永不覆盖、永不删），
+    而 id 的变化**正是 diff 用来检出漂移的信号**。
+
+    真正要防的是另一种情况：一条旧记忆**既没出现在新条目里，
+    也没被声明 replaces / deletes**，却凭空消失了 —— 那才是静默丢失。
+
+    `accounted` 传模型显式声明的 replaced_ids ∪ confirmed_deletes。
+    """
+    missing = set(before_ids) - set(after_ids)
+    unaccounted = sorted(missing - set(accounted))
+    if unaccounted:
+        raise InvariantViolation(
+            f"{'[' + version + '] ' if version else ''}"
+            f"有 {len(unaccounted)} 条旧记忆既不在新条目里、也没被声明取代或删除："
+            f"{unaccounted[:5]}{'…' if len(unaccounted) > 5 else ''}。"
+            "这属于静默丢失。要么在 items 里保留它，要么用 replaces / deletes "
+            "（deletes 必须带 reason）显式声明。"
+        )
 
 
 def save_version(mv: MemoryVersion) -> dict:
@@ -613,7 +728,7 @@ def tokenize(text: str) -> list[str]:
 # 而那条推断因为含「叫什」「么名」反而命中。**问名字永远拿不到答案。**
 #
 # 修法：识别「在问身份」的查询，**跳过 strong 门槛**并给含身份信息的条目加权。
-# 判据完全确定，不引入 embedding（符合project-spec §15 的约束）。
+# 判据完全确定，不引入 embedding（符合总项目指令 §15 的约束）。
 #
 # 注意：门槛放宽只对**身份查询**生效，且只对**含身份词**的条目生效 ——
 # 所以「今天天气怎么样」这类无关查询不会被误召回。
@@ -889,12 +1004,101 @@ def _score(item: MemoryItem, query_tokens: list[str], *, identity_query: bool = 
     return score
 
 
+# ---------------------------------------------------------------------------
+# B2：隐私边界 ——「知道」不等于「愿意说」
+# ---------------------------------------------------------------------------
+#
+# 小满原来的行为是：**检索到什么就注入什么**。
+# 这等于把「诚实」实现成了「无保留」—— 而没有保留余地的坦露不是亲密，是缺边界。
+#
+# 这里要分开两件事：
+#   记忆**存在**    条目仍在版本里，检索仍会命中（可查、可复核）
+#   **适合表达**    当前场景下要不要把它摆到台面上
+#
+# 判据照抄卷三的 willingness 形状，但**只用小满已有的数据**，全程不用模型：
+#
+#   trust   关系状态（0–100，来自 relationship 的事件流纯函数）
+#   direct  本轮查询对该条目的**直接程度**（命中分 / 2，2 次强命中即满分）
+#   privacy 条目自身的私密程度（确定性关键词）
+#   threat  当前关系的冲突水平（0–1，来自 relationship 的 conflict）
+#
+# 数值经过手工核对（见每条注释），保证：
+#   · 非私密条目**永远不受影响**（privacy=0 时任何情况都 ≥ 0.35）
+#   · 私密条目**只有被直接问到才会说**（direct 低就压到阈值下）
+PRIVACY_BASE = 0.40            # 基线宽容度
+PRIVACY_TRUST_WEIGHT = 0.50    # 越信任越愿意说
+PRIVACY_DIRECT_WEIGHT = 0.80   # 用户问得越直接越愿意说
+PRIVACY_THREAT_WEIGHT = 0.50   # 关系里有冲突时更收
+PRIVACY_THRESHOLD = 0.35       # 低于此值 → 暂不表达
+PRIVACY_DIRECT_FULL_SCORE = 2.0  # 命中分到这个数，视为「问得很直接」
+
+# 私密话题的确定性判据（不用模型；与 _CATEGORY_RULES 同一风格）
+_PRIVATE_MARKERS = (
+    "家里", "家人", "父母", "爸", "妈", "钱", "经济", "工资", "借钱", "欠",
+    "生病", "医院", "难受", "难过", "哭", "吵架", "分手", "失恋", "被拒",
+    "秘密", "不想说", "不愿意说", "别问", "隐私", "自卑", "害怕", "焦虑",
+)
+
+
+def privacy_sensitivity(item: "MemoryItem") -> float:
+    """条目自身的私密程度 ∈ [0, 1]。确定性关键词，不调用模型。"""
+    if any(m in (item.text or "") for m in _PRIVATE_MARKERS):
+        return 1.0
+    if item.category == "关系经历":
+        return 0.5
+    return 0.0
+
+
+def privacy_withhold(
+    items: list["MemoryItem"],
+    *,
+    trust: float = 50.0,
+    threat: float = 0.0,
+    scores: dict[str, float] | None = None,
+    threshold: float = PRIVACY_THRESHOLD,
+) -> tuple[list["MemoryItem"], list["MemoryItem"]]:
+    """把检索结果分成 **(可表达, 暂不表达)**。
+
+    **只判断要不要说，不删条目、不改记忆、不写库** ——
+    被挡下的条目仍然存在于记忆版本里，调用方应自行留痕（见 retrieve.py 的日志）。
+
+    默认 `trust=50` / `threat=0`：不知道关系状态时按中性处理，
+    此时非私密条目一律放行（privacy=0 → 0.40 基线已高于阈值）。
+    """
+    kept: list["MemoryItem"] = []
+    withheld: list["MemoryItem"] = []
+    trust_norm = max(0.0, min(1.0, float(trust) / 100.0))
+    threat_norm = max(0.0, min(1.0, float(threat)))
+
+    for it in items:
+        need = privacy_sensitivity(it)
+        if need <= 0.0:
+            # 非私密：不介入。这条快速路径保证 B2 的影响面**只限于私密条目**。
+            kept.append(it)
+            continue
+
+        raw = 0.0 if scores is None else float(scores.get(it.id, 0.0))
+        direct = max(0.0, min(1.0, raw / PRIVACY_DIRECT_FULL_SCORE))
+
+        willingness = (
+            PRIVACY_BASE
+            + PRIVACY_TRUST_WEIGHT * trust_norm
+            + PRIVACY_DIRECT_WEIGHT * direct
+            - need
+            - PRIVACY_THREAT_WEIGHT * threat_norm
+        )
+        (kept if willingness >= threshold else withheld).append(it)
+
+    return kept, withheld
+
+
 def retrieve(
     mv: MemoryVersion | None,
     query: str,
     *,
     top_k: int = 5,
     layered: bool = True,
+    recall_counts: dict[str, int] | None = None,
 ) -> list[MemoryItem]:
     """从给定记忆版本里取 top-k 条目。
 
@@ -936,7 +1140,15 @@ def retrieve(
         scored = [(it, s) for it, s in scored if s > 0]
         # 相关度为主，重要性为微调（乘 0.3 权重，避免重要性压过相关性）。
         # 分数相同按 id 升序 —— 完全确定，不依赖 dict/DB 顺序。
-        scored.sort(key=lambda p: (-(p[1] + 0.3 * importance(p[0])), p[0].id))
+        #
+        # B3：`recall_counts` 是**派生**出来的真实召回次数（不写回条目）。
+        # 它只经由 importance 起作用，且被上面的 0.3 压过 —— 不会抢戏。
+        def key(pair):
+            it, s = pair
+            rc = None if recall_counts is None else recall_counts.get(it.id)
+            return (-(s + 0.3 * importance(it, recall_count=rc)), it.id)
+
+        scored.sort(key=key)
         return scored
 
     if not layered:
@@ -980,21 +1192,65 @@ def retrieve_scored(
     return scored[: max(0, top_k)]
 
 
-def render_for_prompt(items: list[MemoryItem]) -> str:
+# ---------------------------------------------------------------------------
+# B5：资源适配 —— 心光不够时，「重要也只能浅处理」
+# ---------------------------------------------------------------------------
+#
+# 上下文是**真实稀缺资源**：一条长记忆原来可以挤掉三条短记忆，
+# 只因为它的 2-gram 重叠多。卷一的修正是：资源不够时**降处理深度，而不是丢掉候选**。
+#
+# 这里刻意**不新增配置项**，沿用本模块既有的「模块级常量」风格
+# （与 DECAY_HALF_LIFE_DAYS / CORE_MAX_ITEMS 一致）。
+INJECT_BUDGET_CHARS = 700     # 一次注入记忆的字符预算（含头尾说明）
+INJECT_SHORT_CHARS = 42       # 超预算时，后排条目降级成这么长的摘要
+
+
+def render_for_prompt(items: list[MemoryItem], *, budget_chars: int | None = None) -> str:
     """把记忆条目拼成注入上下文的一段文字。
 
-    刻意标注 type 与来源事件：让模型知道哪些是用户原话、哪些是它自己先前的推断，
-    避免 INFERENCE 在后续轮次里被当成 FACT 使用。
+    两件事：
+
+    1. **标注来源与性质**（B1）—— 让模型知道哪些是用户原话、
+       哪些是它自己先前的推断。刻意不止标一个英文 tag：
+       `[INFERENCE]` 的信号太弱，模型仍可能当事实讲出去，
+       所以对推断/重建类补一句整句中文提醒。
+
+    2. **资源适配**（B5）—— 超出字符预算时，把**后排**（相关度最低）的条目
+       降级成短摘要，而不是把整条丢掉。
+       「资源不够就浅处理」—— 条目**仍在上下文里**，只是说得简略。
     """
     if not items:
         return ""
-    lines = ["【你记得的关于用户的事】"]
-    for it in items:
+
+    budget = INJECT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
+    header = "【你记得的关于用户的事】"
+    footer = "以上是长期记忆。若与本次对话冲突，以用户当前说法为准。"
+
+    def line_for(it: MemoryItem, *, short: bool = False) -> str:
+        text = it.text or ""
+        if short and len(text) > INJECT_SHORT_CHARS:
+            text = text[:INJECT_SHORT_CHARS] + "…"
         src = "、".join(it.source_event_ids) if it.source_event_ids else "（无来源）"
-        tag = it.type
-        lines.append(f"- [{tag}] {it.text}（来源：{src}）")
-    lines.append("以上是长期记忆。若与本次对话冲突，以用户当前说法为准。")
-    return "\n".join(lines)
+        out = f"- [{it.type}] {text}（来源：{src}）"
+        caveat = _PROVENANCE_CAVEAT.get(it.provenance or "")
+        if caveat and not short:
+            out += f"　⚠️{caveat}"
+        return out
+
+    body = [line_for(it) for it in items]
+
+    def total(lines: list[str]) -> int:
+        return len(header) + sum(len(x) + 1 for x in lines) + len(footer)
+
+    if total(body) > budget:
+        # 从**最后一条**（相关度最低）开始降级，够用就停。
+        # 不删条目 —— 宁可说得简略，也不让"想起来过"变成"没想起来"。
+        for i in range(len(body) - 1, -1, -1):
+            if total(body) <= budget:
+                break
+            body[i] = line_for(items[i], short=True)
+
+    return "\n".join([header] + body + [footer])
 
 
 def render_full_version(mv: "MemoryVersion | None") -> str:

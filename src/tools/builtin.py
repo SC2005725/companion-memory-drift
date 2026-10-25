@@ -1,6 +1,6 @@
 """内置工具（Phase 9）。
 
-project-spec §30 说「然后逐渐接：Filesystem / Python / Browser / MCP / DSH」。
+总项目指令 §30 说「然后逐渐接：Filesystem / Python / Browser / MCP / DSH」。
 
 **这里只做三个立刻有用的，刻意不做浏览器和 MCP** —— 没有具体需求就先不加，
 加一个用不上的工具只会增加权限面与维护成本。

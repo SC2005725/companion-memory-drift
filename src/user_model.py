@@ -1,6 +1,6 @@
 """用户模型（Phase 7）。
 
-对应《project-spec》§7「User Model」与 §28「Phase 7 User Model」。
+对应《总项目指令》§7「User Model」与 §28「Phase 7 User Model」。
 
 ## 它和记忆层（Phase 5）的区别
 
@@ -43,7 +43,10 @@ import re
 from datetime import datetime
 
 from paths import USER_MODEL_DIR, ensure_dirs
+import snapshots
 import storage
+
+_SNAP_PREFIX = "model_v"
 
 # 判断状态（§28 的 confirmed / inferred / uncertain）
 STATUS_CONFIRMED = "confirmed"      # 用户明确说过的自我描述
@@ -1208,23 +1211,15 @@ def active_items(items: list[dict]) -> list[dict]:
 # ----------------------------------------------------------------------------
 
 def snapshot_path(version: int):
-    return USER_MODEL_DIR / f"model_v{version:03d}.json"
+    return snapshots.path_for(USER_MODEL_DIR, _SNAP_PREFIX, version)
 
 
 def existing_snapshots() -> list[int]:
-    ensure_dirs()
-    out = []
-    for path in USER_MODEL_DIR.glob("model_v*.json"):
-        try:
-            out.append(int(path.stem.split("_v")[1]))
-        except (IndexError, ValueError):
-            continue
-    return sorted(out)
+    return snapshots.scan_versions(USER_MODEL_DIR, prefix=_SNAP_PREFIX, ensure=True)
 
 
 def next_snapshot_version() -> int:
-    versions = existing_snapshots()
-    return (versions[-1] + 1) if versions else 1
+    return snapshots.next_version(existing_snapshots())
 
 
 def save_snapshot(items: list[dict], *, note: str = "") -> dict:
@@ -1252,17 +1247,16 @@ def save_snapshot(items: list[dict], *, note: str = "") -> dict:
     # 但"号被占了"不该让整轮变更丢失 —— 往后找一个空号写就行。
     """
     ensure_dirs()
-    version = next_snapshot_version()
-    path = snapshot_path(version)
-    # 撞号就递增找空号（上限防御：正常绝不会走到这么多）
-    for _ in range(1000):
-        if not path.exists():
-            break
-        version += 1
-        path = snapshot_path(version)
-    else:
+    # seek=True：撞号往后找空号。
+    # 原实现就是在这里踩过「撞号抛错 → 整轮变更静默丢失」的事故（见上方 docstring），
+    # `snapshots.resolve_version` 沿用**同一策略与同一上限**，语义不变。
+    version, path, status = snapshots.resolve_version(
+        USER_MODEL_DIR, prefix=_SNAP_PREFIX, seek=True
+    )
+    if status == "exhausted":
         raise UserModelError(
-            f"连续 1000 个快照号都被占用，拒绝继续：{path.name}（请检查 user_model/ 目录）"
+            f"连续 {snapshots.SCAN_LIMIT} 个快照号都被占用，拒绝继续："
+            f"{path.name}（请检查 user_model/ 目录）"
         )
 
     payload = {
@@ -1274,7 +1268,7 @@ def save_snapshot(items: list[dict], *, note: str = "") -> dict:
         "items": items,
     }
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    digest = snapshots.digest_of(body)
     path.write_text(body + "\n", encoding="utf-8")
     (USER_MODEL_DIR / f"model_v{version:03d}.sha256").write_text(
         f"{digest}  {path.name}\n", encoding="utf-8"

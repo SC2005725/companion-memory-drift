@@ -42,7 +42,7 @@ class Settings:
 def load_settings() -> Settings:
     if not SETTINGS_FILE.exists():
         raise ConfigError(f"缺少配置文件：{SETTINGS_FILE.name}")
-    raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
 
     cost = raw.get("cost") or {}
     cost = {k: v for k, v in cost.items() if not k.startswith("_")}

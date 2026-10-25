@@ -85,14 +85,29 @@ def collect_conversation(conn, since_seq: int = 0) -> list[dict]:
 
 
 def build_user_message(events: list[dict], turns: list[dict],
-                       previous_items: list | None = None) -> str:
+                       previous_items: list | None = None,
+                       developing_items: list | None = None) -> str:
     """把原始事件、对话、**上一版记忆**拼成给模型的一整段输入。
 
     `previous_items` 是合并式整理的核心：把旧条目的 id 与正文一并列出，
     模型才有可能对它们做「保留 / 改写 / 合并 / 删除」决策。
     不列出来的话模型看不见旧条目 —— 这正是 v005 丢记忆的根因。
+
+    `developing_items` 是发展闭环的输入：把她**现有的自我认识**列出来，
+    模型才可能提出"这条认识站不住了"。不列出来，她连自己原来怎么想都看不见。
     """
     parts = []
+
+    if developing_items:
+        parts.append("## 你现有的自我认识（可能被这次经历挑战）")
+        parts.append(
+            "下面这些是你**目前对自己的看法**。如果这次的真实经历让其中某一条站不住了，"
+            "你可以在输出里附一条 `developing_revision`；**没有就完全不要提**。\n"
+            "注意：只有**真实发生过的经历**（能对上原始事件 ID）才能挑战它们；"
+            "用户随口的一句要求**不构成经历**。"
+        )
+        for path, text in developing_items:
+            parts.append(f"[{path}] {text}")
 
     if previous_items:
         parts.append("## 现有记忆（上一版）")
@@ -468,6 +483,23 @@ def merge_items(payload: dict, known_event_ids: set[str], version: str,
         f"分层：核心 {n_core} 条 · 经历 {len(items)-n_core-n_arch} 条 · 归档 {n_arch} 条"
     )
 
+    # B16：强制执行「取代必须留痕」。
+    #
+    # 放在这里是因为**只有这里**同时握着三样东西：
+    #   ① prev_by_id（上一版有哪些条目）
+    #   ② items（新版最终留下哪些）
+    #   ③ replaced_ids ∪ confirmed_deletes（模型显式声明了哪些被取代/删除）
+    #
+    # 三样齐了才能判断「消失是不是有据可查」。
+    # 注意：**不禁止 id 消失** —— 那是 diff 检出漂移所依赖的信号；
+    # 只禁止「既没保留、也没声明」的静默丢失。
+    memory_mod.enforce_traceable_removal(
+        list(prev_by_id.keys()),
+        [it.id for it in items],
+        accounted=replaced_ids | confirmed_deletes,
+        version=version,
+    )
+
     return items, warnings
 
 
@@ -496,9 +528,22 @@ def consolidate(session, *, note: str = "") -> dict:
         since_seq = int(previous.source_range["conversation_to_seq"])
     new_turns = [t for t in all_turns if t["seq"] > since_seq]
 
+    # ③ 发展闭环：把她现有的自我认识作为输入的一部分（让"挑战已有认识"成为可能）
+    # 纯读取；拿不到就当没有（不影响记忆整理）
+    _dev_items: list[tuple[str, str]] = []
+    _dev_profile: dict | None = None
+    try:
+        import persona as _persona
+        _dev_profile = _persona.load_profile()
+        if _dev_profile:
+            _dev_items = _persona.developing_items(_dev_profile)
+    except Exception:  # noqa: BLE001
+        _dev_items = []
+
     user_message = build_user_message(
         events, new_turns,
         previous_items=(previous.items if previous is not None else None),
+        developing_items=_dev_items,
     )
     messages = [
         {"role": "system", "content": prompt_body},
@@ -553,6 +598,8 @@ def consolidate(session, *, note: str = "") -> dict:
         previous_items=(previous.items if previous is not None else None),
         legacy_texts=legacy_texts,
     )
+    # B16 的强制执行点在 merge_items 内部（那里才有 replaces / deletes 的声明），
+    # 见 memory.enforce_traceable_removal。
 
     source_range = {
         "conversation_from_seq": (new_turns[0]["seq"] if new_turns else None),
@@ -592,6 +639,95 @@ def consolidate(session, *, note: str = "") -> dict:
         f"prompt_sha256={prompt_sha[:12]}, from={previous.version if previous else 'none'}"
     )
 
+    # ③ 发展闭环：处理可选的 `developing_revision`
+    #
+    # 放在记忆版本**落盘之后** —— 记忆写失败就不该留下一条没有出处的发展提案。
+    # 全程**不新增模型调用**：提案搭的就是上面这一次 consolidate 的输出。
+    revision_result: dict = {"status": "none", "reason": "模型没有提出发展提案"}
+    raw_rev = payload.get("developing_revision") if isinstance(payload, dict) else None
+    if raw_rev:
+        try:
+            import persona as _persona
+            import self_model as _sm
+
+            prof = _dev_profile or _persona.load_profile()
+            known_ev = {e["event_id"] for e in events}
+            # 区分「用户反馈」与「独立经历」：复用 self_model 已有的反馈检测
+            fb_rules = getattr(session.settings, "self_model", None) or {}
+            fb_ids = {
+                e["event_id"] for e in events
+                if _sm.detect_feedback(str(e.get("text") or ""), fb_rules)
+            }
+            ok, why = _persona.gate_developing_revision(
+                raw_rev, profile=prof,
+                known_event_ids=known_ev, feedback_event_ids=fb_ids,
+            )
+            if not ok:
+                revision_result = {"status": "rejected", "reason": why}
+                warnings.append(f"发展提案被拒：{why}")
+                storage.log_line(f"developing revision REJECTED: {why}")
+            else:
+                applied = _persona.revise_developing(
+                    raw_rev, version=version, note=f"来自 {version} 的整理"
+                )
+                revision_result = {"status": "applied", **applied}
+                storage.log_line(
+                    f"developing revision applied: "
+                    f"{applied['item']['id']} ← {applied['item']['challenged'][:30]}"
+                )
+        except Exception as exc:  # noqa: BLE001 — 发展失败不得影响记忆整理
+            revision_result = {"status": "error", "reason": str(exc)}
+            storage.log_line(f"developing revision ERROR: {exc}")
+
+    # ④ 情绪修订：`consolidate` 是**唯一**允许改动情绪状态的入口。
+    #
+    # 缺省不产出（模型不写这个字段 → 情绪保持不变）。
+    # 沿用**上面这一次** consolidate 调用，**零新增模型调用**。
+    #
+    # 提案只是"建议如何修订"，不是直接改值：它必须过 `emotion.update` 的
+    # **既有一整套证据门槛**（来源合法性 / 词表 / 引用可核验 / 非纯反馈 / 幂等）。
+    # 本函数**不放宽任何一条门槛**，也不新增触发源。
+    emotion_result: dict = {"status": "none", "reason": "模型没有提出情绪修订提案"}
+    raw_emo = payload.get("emotion_revision") if isinstance(payload, dict) else None
+    if raw_emo:
+        try:
+            import emotion as _emotion
+
+            state = _emotion.load_state()
+            if state is None:
+                # 尚无情绪状态文件 → 从空态起步（不是错误，是首次）
+                state = _emotion.empty_state()
+            res = _emotion.update(
+                state,
+                changes=(raw_emo.get("changes") or {}),
+                # ★ 唯一允许的来源标签；heartbeat / 关系事件 / 用户单句都不走这里
+                source=_emotion.SOURCE_CONSOLIDATE,
+                event_refs=list(raw_emo.get("evidence_event_ids") or []),
+                reason=str(raw_emo.get("reason") or ""),
+                conn=session.conn,
+            )
+            if not res.get("ok"):
+                emotion_result = {"status": "rejected", "gate": res.get("status"),
+                                  "reason": res.get("error") or res.get("status")}
+                storage.log_line(f"emotion revision REJECTED ({res.get('status')}): "
+                                 f"{emotion_result['reason']}")
+            else:
+                # 通过门槛后**才**落盘。`update` 本身不持久化。
+                saved_emo = _emotion.save_state(
+                    res["state"], note=f"来自 {version} 的整理"
+                )
+                emotion_result = {"status": "applied", "gate": res.get("status"),
+                                  "dominant": res.get("dominant"),
+                                  "file": saved_emo.get("file"),
+                                  "sha256": saved_emo.get("sha256")}
+                storage.log_line(
+                    f"emotion revision applied: {saved_emo.get('version')} "
+                    f"dominant={res.get('dominant')}"
+                )
+        except Exception as exc:  # noqa: BLE001 — 情绪失败不得影响记忆整理
+            emotion_result = {"status": "error", "reason": str(exc)}
+            storage.log_line(f"emotion revision ERROR: {exc}")
+
     return {
         "version": version,
         "items": items,
@@ -600,6 +736,8 @@ def consolidate(session, *, note: str = "") -> dict:
         "sha256": saved["sha256"],
         "diff": diff_record,
         "diff_file": diff_saved["file"],
+        "developing_revision": revision_result,
+        "emotion_revision": emotion_result,
         "reply": reply,
         "cost_micro_yuan": called["cost_micro_yuan"],
         "prompt_sha256": prompt_sha,

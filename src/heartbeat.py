@@ -1,6 +1,6 @@
 """心跳与主动性（Phase 8）。
 
-对应《project-spec》§8「Agency / 主动性」、§9「Heartbeat / Timer」、§29「Phase 8 Agency」。
+对应《总项目指令》§8「Agency / 主动性」、§9「Heartbeat / Timer」、§29「Phase 8 Agency」。
 
 ## 三句话先说清这个模块的定位
 
@@ -35,7 +35,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import storage
 
@@ -47,6 +47,33 @@ DECISION_LABELS = {
     "proactive_message": "主动消息",
     "update_state": "更新内部状态",
 }
+
+
+# ---------------------------------------------------------------------------
+# Phase B：触发来源
+# ---------------------------------------------------------------------------
+#
+# 心跳只有三种"被叫醒"的方式，全部是**外部驱动**（本模块不自建后台任务）：
+#
+#   manual    CLI：`python src\main.py heartbeat`
+#   chat      用户开口时顺带检查（chat.send_once 调用 maybe_tick）
+#   schedule  预留：未来定时器。**本阶段不实现，也没有任何代码会产生它。**
+#
+# trigger 只用于留痕，**不参与判定** —— `decide()` 是纯函数，不看它。
+#
+# ⚠️ 这几个常量必须在 `tick()` **之前**定义：`tick` 用 `TRIGGER_MANUAL`
+# 作默认参数，而默认参数在 def 时就求值（放到后面会 NameError）。
+TRIGGER_MANUAL = "manual"
+TRIGGER_CHAT = "chat"
+TRIGGER_SCHEDULE = "schedule"      # ← 预留位，当前无生产者
+TRIGGERS = (TRIGGER_MANUAL, TRIGGER_CHAT, TRIGGER_SCHEDULE)
+
+# 距上次检查的最小间隔（分钟）。同一触发源在间隔内重复触发会被跳过。
+#
+# 实测教训：初版用「距上次对话不足 1 小时就跳过」做节流 ——
+# 但正常聊天间隔通常小于 1 小时，结果是心跳**永远不会跑**，
+# 连一行运行记录都看不到，等于把功能藏起来了。改成按"上次检查"去重。
+MIN_GAP_MINUTES = 5.0
 
 
 # ----------------------------------------------------------------------------
@@ -278,22 +305,29 @@ def pick_followup(context: dict, rules: dict) -> dict | None:
 # 执行一次心跳
 # ----------------------------------------------------------------------------
 
-def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False) -> dict:
+def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
+         trigger: str = TRIGGER_MANUAL) -> dict:
     """跑一次心跳检查：收集状态 → 决策 → 落盘。
 
     `dry_run=True` 时只算不写，方便查看「如果现在检查，会怎么决定」。
 
+    `trigger` 记录**这次检查是被谁触发的**（manual / chat / schedule）——
+    只为可追溯，不改变任何判定逻辑（`decide` 是纯函数，不看 trigger）。
+
     **注意**：本函数不调用模型，不花钱。
+    落盘时会显式记下 `model_called: False`，让"这次到底花没花钱"可事后核对。
     """
     rules = settings.heartbeat or {}
     if not rules:
         raise RuntimeError("settings.json 里没有 heartbeat 规则，无法执行心跳")
 
+    trigger = trigger if trigger in TRIGGERS else TRIGGER_MANUAL
     context = collect_context(conn, settings, now=now)
     result = decide(context, rules)
 
     if dry_run:
-        return {**result, "context": context, "run_id": None, "pending_id": None, "dry_run": True}
+        return {**result, "context": context, "run_id": None, "pending_id": None,
+                "dry_run": True, "trigger": trigger}
 
     run_id = storage.record_heartbeat_run(
         conn,
@@ -306,6 +340,9 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False) 
             "pending_count": context.get("pending_count"),
             "stage": (context.get("relationship") or {}).get("stage"),
             "user_model_active": context.get("user_model_active"),
+            # Phase B 起新增（放在既有的 JSON context 列里，**不动表结构**）：
+            "trigger": trigger,          # 谁触发的：manual / chat / schedule
+            "model_called": False,       # 本阶段心跳**全程不调模型**，显式留痕
         },
     )
 
@@ -327,7 +364,157 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False) 
         )
 
     return {**result, "context": context, "run_id": run_id, "pending_id": pending_id,
-            "dry_run": False}
+            "dry_run": False, "trigger": trigger}
+
+
+# ---------------------------------------------------------------------------
+# Phase B：扩展点（**只预留，不实现**）
+# ---------------------------------------------------------------------------
+#
+# ## Phase C 预留：模型适配器挂钩
+#
+# Phase C 会建立统一模型适配接口（本地 / 免费 / 现有客户端三种）。
+# 本阶段**只留位置**，明确三件事：
+#
+#   1. 心跳当前**全程不调模型** —— 注册了适配器也不会被调用；
+#   2. 接口形状固定为 `available() -> bool` 与 `generate(prompt) -> str`；
+#   3. `maybe_tick` 用 try/except 包住一切，**适配器失败不得影响心跳与聊天**。
+#
+# 不实现任何适配器，不接入任何模型服务。
+MODEL_ADAPTER = None
+
+
+def set_model_adapter(adapter) -> None:
+    """注册模型适配器（Phase C 用）。本阶段不会调用它。
+
+    `adapter` 需实现：
+        available() -> bool         当前是否可用（免费额度耗尽、超时都应返回 False）
+        generate(prompt: str) -> str
+
+    传入 `None` 可注销。**心跳在任何情况下都不因适配器失败而中断。**
+    """
+    global MODEL_ADAPTER
+    MODEL_ADAPTER = adapter
+
+
+def enable_model_adapter(router=None) -> dict:
+    """Phase C 对接：把**适配层路由**接到 Phase B 的扩展点。
+
+    ⚠️ **必须显式调用才会生效。** 模块导入、心跳运行都不会自动调用它 ——
+    这正是"默认不执行任何模型调用"的保证。
+
+    返回一份自述（包含可用性），方便在 CLI 里确认接的是哪一层。
+    """
+    import model_adapter as ma
+    adapter = ma.as_heartbeat_adapter(router)
+    set_model_adapter(adapter)
+    return {"attached": True, "adapter": adapter.name,
+            "available": adapter.available()}
+
+
+# —— maybe_tick 的结果状态（Phase D.2）——
+#
+# 修复前：节流、配置错误、运行时异常**全部压成同一个 `None`**，
+# 调用方无法区分「没到时候」和「坏了」——
+# 实测症状：`settings.heartbeat` 缺失时心跳永远不跑，界面上看不出来。
+#
+# 现在每种原因一个状态，**配置错误不再伪装成节流**。
+TICK_THROTTLED = "throttled"                # 距上次检查太近，本次不跑
+TICK_PENDING_ACTION = "pending_action"      # 已有待处理项，先兑现、不重复生成
+TICK_EXECUTED = "executed"                  # 真的跑了一次 tick（内含 result）
+TICK_CONFIG_ERROR = "configuration_error"   # 配置有问题（心跳规则缺失等）
+TICK_RUNTIME_ERROR = "runtime_error"        # 其他运行时异常（含异常类型，可追踪）
+TICK_STATUSES = (TICK_THROTTLED, TICK_PENDING_ACTION, TICK_EXECUTED,
+                 TICK_CONFIG_ERROR, TICK_RUNTIME_ERROR)
+
+
+def maybe_tick(session, *, now: datetime | None = None,
+               trigger: str = TRIGGER_CHAT) -> dict:
+    """**节流版触发**：满足间隔才真跑。
+
+    此前这段策略写在 `chat.py` 里（`maybe_heartbeat_tick`）——
+    那等于"心跳的触发策略住在聊天模块"。Phase B 把它移回心跳自己这里，
+    让心跳对自己的触发负责。**判定逻辑一行没动**（仍走 `tick` → `decide`）。
+
+    ## 返回：**总是 dict**（Phase D.2 改）
+
+    原实现返回 `dict | None`，把三种完全不同的情况压成同一个 `None`。
+    现在返回 `{status, executed, trigger, ...}`，`status` ∈ `TICK_STATUSES`：
+
+    | status | 含义 | 额外字段 |
+    |---|---|---|
+    | `throttled` | 距上次检查不到 `MIN_GAP_MINUTES` | `gap_minutes` |
+    | `pending_action` | 已有待处理主动意图，先兑现 | `pending_count` |
+    | `executed` | 真的跑了一次 | `result`（tick 的完整返回） |
+    | `configuration_error` | 心跳规则缺失/格式不可用 | `error` |
+    | `runtime_error` | 其他异常 | `error`（含异常类型） |
+
+    ## 兼容性
+
+    `chat.py` 的调用点只把它存进返回字典（`"heartbeat": heartbeat_result`），
+    **没有任何调用者判断 `is None`**，所以改返回类型不影响现有流程。
+    `chat.maybe_heartbeat_tick` 的类型标注已同步为 `dict`。
+
+    ## 失败绝不阻断聊天
+
+    一切异常都被接住并转成 `runtime_error`，仍然不抛给聊天；
+    但**不再静默** —— `status` 与 `error` 都带出去，并写一行日志。
+    """
+    import storage
+    trigger = trigger if trigger in TRIGGERS else TRIGGER_CHAT
+
+    # ① 配置先自查 —— 让「配置错误」与「节流」在**产生点**就分开，
+    #    而不是靠事后匹配异常文案
+    rules = getattr(session.settings, "heartbeat", None) or {}
+    if not rules:
+        msg = "settings.heartbeat 缺失或为空，心跳无法执行"
+        try:
+            storage.log_line(f"heartbeat CONFIG ERROR: {msg}")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": TICK_CONFIG_ERROR, "executed": False, "trigger": trigger,
+                "error": msg}
+
+    try:
+        # ② 已有待处理 → 先让它兑现，不重复生成
+        if storage.list_pending_actions(session.conn, status="pending"):
+            n = len(storage.list_pending_actions(session.conn, status="pending"))
+            return {"status": TICK_PENDING_ACTION, "executed": False,
+                    "trigger": trigger, "pending_count": n}
+
+        # ③ 距**上次心跳检查**太近 → 跳过
+        last = session.conn.execute(
+            "SELECT created_at_utc FROM heartbeat_runs ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if last is not None:
+            raw = last["created_at_utc"] if hasattr(last, "keys") else last[0]
+            last_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            now_dt = now or datetime.now(timezone.utc)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+            gap_min = (now_dt - last_dt).total_seconds() / 60
+            if gap_min < MIN_GAP_MINUTES:
+                return {"status": TICK_THROTTLED, "executed": False,
+                        "trigger": trigger, "gap_minutes": round(gap_min, 2)}
+        else:
+            gap_min = None
+
+        result = tick(session.conn, session.settings, now=now, trigger=trigger)
+        session.conn.commit()
+        return {"status": TICK_EXECUTED, "executed": True, "trigger": trigger,
+                "gap_minutes": None if gap_min is None else round(gap_min, 2),
+                "result": result}
+
+    except Exception as exc:  # noqa: BLE001 — 心跳失败不得影响聊天
+        msg = f"{type(exc).__name__}: {exc}"
+        try:
+            storage.log_line(f"heartbeat RUNTIME ERROR（不影响聊天）: {msg}")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": TICK_RUNTIME_ERROR, "executed": False, "trigger": trigger,
+                "error": msg}
 
 
 def render_for_prompt(pending: list) -> str:

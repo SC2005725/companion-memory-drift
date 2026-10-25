@@ -209,6 +209,7 @@ def build_messages(
     tools_text: str = "",
     expression_text: str = "",
     inject_history: bool = True,
+    user_image: str | None = None,
 ) -> list[dict]:
     """组装一次调用的 messages。
 
@@ -263,7 +264,30 @@ def build_messages(
             messages.append({"role": "user", "content": item["user"]})
             if item["assistant"]:
                 messages.append({"role": "assistant", "content": item["assistant"]})
-    messages.append({"role": "user", "content": user_text})
+    # 用户这一轮的消息。带图时用**多模态 content**（列表），否则仍是纯字符串 ——
+    # 不带图的路径**逐字不变**，所以原有行为零影响。
+    #
+    # ⚠️ 图放在**文字之前**：模型先看到图再看问题，比反过来更少出现"没看图"。
+    if user_image:
+        try:
+            import images as images_mod
+            _uri = images_mod.as_data_uri(user_image)
+            _parts = [{"type": "image_url", "image_url": {"url": _uri}}]
+            if (user_text or "").strip():
+                _parts.append({"type": "text", "text": user_text})
+            else:
+                _parts.append({"type": "text",
+                               "text": "（我发了张图，没打字）"})
+            messages.append({"role": "user", "content": _parts})
+        except Exception as exc:  # noqa: BLE001 — 图读不出来不能让对话挂掉
+            # 降级：退回纯文字，并**明确告诉她发生了什么** ——
+            # 否则她会以为用户什么都没发，而用户以为发出去了。
+            storage.log_line(f"image attach FAILED（降级为纯文字）: {exc}")
+            messages.append({"role": "user",
+                             "content": (user_text or "")
+                             + "\n（我本来想发张图，但没读出来）"})
+    else:
+        messages.append({"role": "user", "content": user_text})
     return messages
 
 
@@ -437,6 +461,7 @@ def send_once(
     memory_version: str | None = None,
     full_memory_version: bool = False,
     use_relationship: bool = True,
+    user_image: str | None = None,
 ) -> dict:
     """执行一次完整往返。返回本轮落盘结果摘要。
 
@@ -563,12 +588,25 @@ def send_once(
         topic_seeds = []
         concerns = []
 
+    # ① 人格出口：她自己的价值观 / 哲学能不能参与这一轮的表达。
+    #
+    # 由 `persona.pick_stance` 判定「本轮是否出现值得表态的判断点」——
+    # 两道闸门（对方在表态 + 落在她的价值主题内）都过才有值。
+    # 零模型调用；不产出时 `expression_text` 与补齐前**逐字一致**。
+    stance: dict | None = None
+    try:
+        import persona as persona_mod
+        stance = persona_mod.pick_stance(persona_mod.load_profile(), user_text, limit=1)
+    except Exception:  # noqa: BLE001 — 增强功能，失败就当作没有
+        stance = None
+
     expression_text = session.persona.render_expression_adjustment(
         relationship_state=(state if use_relationship and rel_rules else None),
         user_model_items=um_items,
         memory_hit_count=len(ret["retrieval"].get("items") or []),
         topic_seeds=topic_seeds,
         concerns=concerns,
+        stance=stance,
     )
 
     messages = build_messages(
@@ -582,7 +620,73 @@ def send_once(
         tools_text=tools_text,
         expression_text=expression_text,
         inject_history=inject_history,
+        user_image=user_image,
     )
+
+    # 待续线索 P0：**关注点注入留痕**。
+    #
+    # ## 为什么放在这个位置
+    #
+    # 这里是「最终上下文已经确定、模型还没被调用」的唯一时刻。
+    # 之前（L558）只知道"谁被选为候选"，之后（L599）就已经发生调用了。
+    # 只有在这里才能回答"它到底进没进上下文"。
+    #
+    # ## 怎么判断"真的进去了"
+    #
+    # **不看变量、看真实的 messages**：`render_expression_adjustment` 会把
+    # 线索片段截到 54 字并去掉尾部标点（见 persona.py），所以这里用**同一口径**
+    # 截出 snippet，再在组装好的 messages 全文里找它。
+    # 找不到 → `injected=0`（选为候选但没进上下文）—— **不记成已注入**。
+    #
+    # ## 绝不影响聊天
+    #
+    # 全程吞异常并记日志：留痕是观测，**任何时候都不该让正常对话失败**。
+    # 写失败会留一行日志，**不会静默当作已观测**。
+    if concerns:
+        try:
+            _blob = "\n".join(str(m.get("content") or "") for m in messages)
+            _ev = {}
+            try:
+                for _it in (_mv.items or []):          # noqa: F821 — 上面 try 里已赋值
+                    _ev[_it.id] = list(getattr(_it, "source_event_ids", None) or [])
+            except Exception:  # noqa: BLE001 — 拿不到来源就不填，不影响留痕
+                _ev = {}
+            _rows = []
+            for _c in concerns:
+                _c = _c or {}
+                _t = str(_c.get("text") or "")
+                if not _t:
+                    continue
+                _snip = _t.strip().rstrip("。！？；，、 ")[:54]
+                _iid = str(_c.get("id") or "")
+                _rows.append({
+                    "item_id": _iid,
+                    "text": _t,
+                    "matched": _c.get("matched") or [],
+                    "category": _c.get("category") or "",
+                    "source_event_ids": _ev.get(_iid, []),
+                    "injected": bool(_snip) and _snip in _blob,
+                    "method": "pick_concerns",
+                })
+            _n = storage.record_concern_injections(
+                session.conn,
+                session_id=session.session_id,
+                turn_id=turn_id,
+                seq=seq,
+                items=_rows,
+            )
+            if _rows and _n == 0:
+                # 幂等命中（本轮已有记录）——留一行，避免被当成"没观测到"
+                storage.log_line(
+                    f"concern trace: {len(_rows)} candidate(s) already recorded "
+                    f"for turn {turn_id} (idempotent skip)"
+                )
+        except Exception as _exc:  # noqa: BLE001 — 留痕失败不得影响聊天
+            try:
+                storage.log_line(f"concern trace FAILED（不影响聊天）: {_exc}")
+            except Exception:  # noqa: BLE001
+                pass
+
     called_first = call_model(session, messages, purpose="chat", turn_id=turn_id)
     called, final_text, raw_text, executed_calls, tool_iterations, tool_truncated = (
         run_tool_loop(session, messages, turn_id=turn_id, seq=seq, called_first=called_first)
@@ -759,78 +863,36 @@ def send_once(
 
 
 # ----------------------------------------------------------------------------
-# Phase 13：心跳的**运行链路**接入
+# Phase 13 起：心跳的运行链路接入
+# Phase B 起：**触发策略已移入 heartbeat.py**（`MIN_GAP_MINUTES` /
+#             `maybe_tick`），本模块只保留一个薄委托，见下方 `maybe_heartbeat_tick`。
+#             原来这里的 `_HEARTBEAT_MIN_GAP_MINUTES` 已随之删除，避免两处各有一个阈值。
 # ----------------------------------------------------------------------------
 
-# 两次心跳检查之间的最小间隔（分钟）。
-#
-# ⚠️ 实测教训：初版用「距上次对话不足 1 小时就跳过」做前置节流 ——
-# 但正常聊天间隔通常小于 1 小时，结果是**心跳永远不会跑**，
-# 连一行运行记录都看不到，等于把功能又藏起来了。
-#
-# 改为按「上次检查」去重：5 分钟内不重复检查（防同一次交互里重复执行），
-# 超过就检查一次。心跳自身的 decide() 仍会因空闲不足而返回 wait ——
-# 那行记录是有价值的（它证明「检查发生过，且当时不该主动」）。
-_HEARTBEAT_MIN_GAP_MINUTES = 5.0
 
-
-def maybe_heartbeat_tick(session: Session) -> dict | None:
+def maybe_heartbeat_tick(session: Session) -> dict:
     """在聊天生命周期里跑一次心跳检查。**零模型调用、零依赖**。
 
-    ## 触发点为什么选在这里
+    ## Phase B：实现已移出 chat.py
 
-    项目**没有调度器**（也没有常驻进程），所以「周期检查」只能寄生在
-    已有的生命周期事件上。用户开口 = 唯一稳定发生的事件，因此挂在
-    `send_once` 里、且在**读取待处理项之前**（这样本次 tick 产生的行动
-    能在同一轮兑现，符合 Phase 8 的既有设计）。
+    触发策略（已有待处理 → 跳过；距上次检查过近 → 跳过）与 tick 调用
+    原在本模块，现全部移入 `heartbeat.maybe_tick()` ——
+    **心跳对自己的触发负责**，不再住在聊天模块里。
 
-    ## 两层节流（缺一不可）
+    本函数保留为**薄委托**，原因只有一个：让 `send_once` 的调用点逐字不变。
 
-    | 层 | 位置 | 作用 |
-    |---|---|---|
-    | 前置 | 本函数 | 已有待处理项 → 跳过；距上次对话不足 N 小时 → **连检查记录都不写** |
-    | 内层 | `heartbeat.decide` | 免打扰 / 冷却 / 积压 / 无话可说 → 不产生新行动 |
+    ## Phase D.2：返回类型由 `dict | None` 改为 `dict`
 
-    前置层解决「每轮都写一行 wait 记录」的噪声；内层解决「不该主动时别主动」。
-    两层都是确定性的，不涉及模型。
+    原实现把「节流 / 配置错误 / 运行时异常」压成同一个 `None`。
+    现在 `heartbeat.maybe_tick` 总是返回带 `status` 的字典
+    （`throttled` / `pending_action` / `executed` / `configuration_error` /
+    `runtime_error`），配置错误不再伪装成节流。
 
-    ## 失败绝不阻断聊天
-
-    心跳是增强；异常一律吞掉并记日志。无待处理事项时直接返回 None。
+    **调用点（`send_once`）无需改动**：它只把这个返回值放进结果字典
+    （`"heartbeat": heartbeat_result`），没有任何地方判断 `is None`。
     """
-    try:
-        import heartbeat as heartbeat_mod
-
-        # ① 已有待处理 → 先让它兑现，不重复生成
-        if storage.list_pending_actions(session.conn, status="pending"):
-            return None
-
-        # ② 距**上次心跳检查**太近 → 跳过（防止同一次交互里重复执行）
-        try:
-            from datetime import datetime, timezone
-            last_hb = session.conn.execute(
-                "SELECT created_at_utc FROM heartbeat_runs ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-            if last_hb is not None:
-                raw = last_hb["created_at_utc"] if hasattr(last_hb, "keys") else last_hb[0]
-                last = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                gap_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
-                if gap_min < _HEARTBEAT_MIN_GAP_MINUTES:
-                    return None
-        except (TypeError, ValueError):
-            pass          # 解析失败就继续（宁可多检查一次，不要漏）
-
-        result = heartbeat_mod.tick(session.conn, session.settings)
-        session.conn.commit()
-        return result
-    except Exception as exc:  # noqa: BLE001 — 心跳失败不影响聊天
-        try:
-            storage.log_line(f"heartbeat tick FAILED（不影响聊天）: {exc}")
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+    import heartbeat as heartbeat_mod
+    return heartbeat_mod.maybe_tick(session, trigger=heartbeat_mod.TRIGGER_CHAT)
 
 
 # ----------------------------------------------------------------------------

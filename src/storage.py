@@ -96,8 +96,45 @@ CREATE TABLE IF NOT EXISTS retrievals (
     injected          INTEGER NOT NULL DEFAULT 0
 );
 
+-- 待续线索 P0：**关注点注入留痕**（独立表）。
+--
+-- ## 为什么不能塞进 retrievals
+--
+-- `retrievals.hit_item_ids` 的语义是**「这一轮真正摆到她面前的记忆」**（见
+-- src/retrieve.py 的 retrieve_and_log 文档），召回计数也从它派生。
+-- 关注点走的是另一条路（chat.py → persona），把它混进那一列会污染
+-- "记忆命中"的口径。所以单开一张表。
+--
+-- ## 只存指纹，不存原文
+--
+-- 这张表的用途是**统计曝光次数**，不是归档对话。所以只留 `text_sha256`
+-- 与 `text_len`：足以判断"是不是同一条"，且**不扩大敏感数据留存范围**。
+--
+-- ## 幂等
+--
+-- `UNIQUE(turn_id, item_id)` + `INSERT OR IGNORE` —— 同一轮同一线索
+-- 重试多少次都只留一条，避免聊天重试产生无法识别的重复记录。
+CREATE TABLE IF NOT EXISTS concern_injections (
+    injection_id     TEXT PRIMARY KEY,
+    created_at_utc   TEXT NOT NULL,
+    created_at_local TEXT NOT NULL,
+    session_id       TEXT,
+    turn_id          TEXT,
+    seq              INTEGER,
+    item_id          TEXT NOT NULL,
+    category         TEXT,
+    matched          TEXT NOT NULL DEFAULT '[]',
+    source_event_ids TEXT NOT NULL DEFAULT '[]',
+    text_sha256      TEXT NOT NULL DEFAULT '',
+    text_len         INTEGER NOT NULL DEFAULT 0,
+    -- 1 = 确认已进入最终模型输入；0 = 被选为候选但**未**进入上下文
+    injected         INTEGER NOT NULL DEFAULT 0,
+    method           TEXT NOT NULL DEFAULT 'pick_concerns',
+    UNIQUE (turn_id, item_id)
+);
+
 -- Phase 6：关系事件流。
--- project-spec §4 要求关系来自「实际互动事件」而非天数累积，所以关系状态
+-- 总项目指令 §4 要求关系来自「实际互动事件」而非天数累积，所以关系状态
 -- 完全由这张表的事件**确定性推导**（见 src/relationship.py 的 derive_state），
 -- 不存在任何按轮次自增的计数器。
 CREATE TABLE IF NOT EXISTS relationship_events (
@@ -131,7 +168,7 @@ CREATE TABLE IF NOT EXISTS user_model_events (
 
 -- Phase 8：心跳（Heartbeat）。每次「检查机会」落一行，**包括决定不行动的情况**。
 --
--- project-spec §29：『「选择不行动」本身也是 Agency』。
+-- 总项目指令 §29：『「选择不行动」本身也是 Agency』。
 -- 所以不行动必须留痕 —— 否则无法回答「她多久主动想过一次」「为什么没说话」。
 CREATE TABLE IF NOT EXISTS heartbeat_runs (
     run_id          TEXT PRIMARY KEY,
@@ -162,7 +199,7 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 
 -- Phase 9：工具调用账本。
 --
--- project-spec §30：工具调用必须「可记录、可追踪、有输入输出、有错误处理、有权限边界」。
+-- 总项目指令 §30：工具调用必须「可记录、可追踪、有输入输出、有错误处理、有权限边界」。
 -- 每次调用（**包括被拒绝和失败的**）都落一行 —— 只记成功的话，
 -- 就无法回答「她有没有尝试越界」。
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -187,7 +224,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 RELATIONSHIP_EVENT_TYPES = ("positive", "negative", "conflict", "shared_experience")
 
-# 心跳可做出的决定（project-spec §8）
+# 心跳可做出的决定（总项目指令 §8）
 HEARTBEAT_DECISIONS = ("no_action", "wait", "proactive_message", "update_state")
 
 
@@ -618,6 +655,80 @@ def latest_memory_version(conn: sqlite3.Connection) -> sqlite3.Row | None:
 # Phase 5：检索落盘（P0 机制，只追加）
 # ----------------------------------------------------------------------------
 
+def record_concern_injections(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None,
+    turn_id: str | None,
+    seq: int | None,
+    items: list[dict],
+) -> int:
+    """记录本轮关注点的注入情况。返回**实际新增**的行数。
+
+    ## 调用时机（待续线索 P0）
+
+    必须在**最终 messages 组装完成之后、模型调用之前**调用，
+    并且由调用方判定 `injected` —— 本函数**不做**"是否进入上下文"的判断
+    （那需要看真实的 messages，只有调用方拿得到）。
+
+    ## 幂等
+
+    `UNIQUE(turn_id, item_id)` + `INSERT OR IGNORE`：同一轮同一线索
+    重复调用只留一条。返回值 = 实际新增数，因此**重复调用会返回 0**。
+
+    ## 失败不静默
+
+    写失败**会抛**（由调用方决定是否吞掉并记日志）—— 不假装写成功。
+
+    ## 只存指纹
+
+    `text` 只用来算 `text_sha256` 与 `text_len`，**原文不落库**。
+    """
+    if not items:
+        return 0
+    utc, local = _now()
+    added = 0
+    for it in items:
+        it = it or {}
+        item_id = str(it.get("item_id") or "").strip()
+        if not item_id:
+            continue
+        text = str(it.get("text") or "")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO concern_injections ("
+            " injection_id, created_at_utc, created_at_local, session_id, turn_id, seq,"
+            " item_id, category, matched, source_event_ids, text_sha256, text_len,"
+            " injected, method) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"cinj_{uuid.uuid4().hex[:12]}", utc, local,
+                session_id, turn_id, seq, item_id,
+                str(it.get("category") or ""),
+                json.dumps(it.get("matched") or [], ensure_ascii=False),
+                json.dumps(it.get("source_event_ids") or [], ensure_ascii=False),
+                hashlib.sha256(text.encode("utf-8")).hexdigest() if text else "",
+                len(text),
+                1 if it.get("injected") else 0,
+                str(it.get("method") or "pick_concerns"),
+            ),
+        )
+        added += max(0, cur.rowcount)
+    return added
+
+
+def list_concern_injections(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    only_injected: bool = False,
+) -> list[sqlite3.Row]:
+    """读关注点留痕（供统计与验收用）。**只读。**"""
+    sql = "SELECT * FROM concern_injections"
+    if only_injected:
+        sql += " WHERE injected = 1"
+    sql += " ORDER BY rowid DESC LIMIT ?"
+    return list(conn.execute(sql, (max(0, int(limit)),)))
+
+
 def record_retrieval(
     conn: sqlite3.Connection,
     *,
@@ -654,6 +765,39 @@ def record_retrieval(
     )
     conn.commit()
     return retrieval_id
+
+
+def count_item_recalls(conn: sqlite3.Connection, *, memory_version: str | None = None) -> dict[str, int]:
+    """B3：从 `retrievals` 表**派生**每条记忆真实被召回了几次。
+
+    ## 为什么不把计数写回记忆条目
+
+    记忆版本文件是**不可变证据**（带 sha256、只追加）。
+    就地给 `recall_count` 加一，会让 v010 的哈希失效 —— 等于篡改实验数据。
+
+    所以计数只从**已有的**检索日志派生：
+    `retrievals.hit_item_ids` 本来就逐轮记着召回了哪些条目，不需要任何 schema 改动。
+
+    `memory_version` 给了就只统计该版本内的召回（同一批 id 在不同版本里含义可能不同）。
+
+    返回 {item_id: 次数}。**只读，不写任何东西。**
+    """
+    counts: dict[str, int] = {}
+    sql = "SELECT hit_item_ids FROM retrievals"
+    args: tuple = ()
+    if memory_version is not None:
+        sql += " WHERE memory_version = ?"
+        args = (memory_version,)
+    for row in conn.execute(sql, args):
+        raw = row[0] if not hasattr(row, "keys") else row["hit_item_ids"]
+        try:
+            ids = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            continue
+        for item_id in ids or []:
+            if item_id:
+                counts[str(item_id)] = counts.get(str(item_id), 0) + 1
+    return counts
 
 
 # ----------------------------------------------------------------------------
@@ -858,7 +1002,7 @@ def record_tool_call(
     """记录一次工具调用。
 
     **被拒绝与失败的调用也要记** —— 只记成功的话，就无法回答
-    「她有没有尝试越界」（project-spec §30 要求可追踪）。
+    「她有没有尝试越界」（总项目指令 §30 要求可追踪）。
     """
     call_id = f"tc_{uuid.uuid4().hex[:12]}"
     created_utc, created_local = _now()

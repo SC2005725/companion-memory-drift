@@ -418,7 +418,7 @@ def cmd_relationship(args) -> int:
 def cmd_usermodel(args) -> int:
     """查看「小满眼中的用户」（用户模型）。不调用模型、不花钱。
 
-    Phase 7 / project-spec §7 与 §28。
+    Phase 7 / 总项目指令 §7 与 §28。
     """
     import user_model as um_mod
     import storage
@@ -477,6 +477,17 @@ def cmd_identity(args) -> int:
         print("=" * 64)
         print(f"生成于 {prof.get('_created_at')}　模型 {prof.get('_model')}")
         print(f"备注 {prof.get('_note')}")
+        # ② 人格不变量：稳定层是否被动过（**可验证**）
+        try:
+            st = persona_mod.verify_profile_stable()
+            mark = "✅" if st["ok"] else "❌"
+            print(f"{mark} 稳定层（身份/价值观/哲学/边界）：{st['reason']}")
+            if st.get("actual"):
+                print(f"   指纹 {st['actual'][:16]}…")
+            print("   可变层：" + " / ".join(persona_mod.DEVELOPING_PROFILE_FIELDS)
+                  + "（允许随经历发展）")
+        except Exception as exc:  # noqa: BLE001 — 展示用途，不该因此中断
+            print(f"[稳定层校验跳过] {exc}")
         print()
         print(persona_mod.render_profile(prof))
         return 0
@@ -594,7 +605,7 @@ def cmd_selfmodel(args) -> int:
 def cmd_heartbeat(args) -> int:
     """跑一次心跳检查（不调用模型、不花钱）。
 
-    Phase 8 / project-spec §8 §9 §29。Heartbeat 只提供「时间流逝」和「检查机会」，
+    Phase 8 / 总项目指令 §8 §9 §29。Heartbeat 只提供「时间流逝」和「检查机会」，
     真正的主动性来自当前状态；**「选择不行动」本身也是 Agency**，所以不行动也会落盘。
     """
     import heartbeat as hb_mod
@@ -610,7 +621,8 @@ def cmd_heartbeat(args) -> int:
     conn = storage.connect()
     try:
         try:
-            result = hb_mod.tick(conn, settings, dry_run=args.dry_run)
+            result = hb_mod.tick(conn, settings, dry_run=args.dry_run,
+                                 trigger=hb_mod.TRIGGER_MANUAL)
         except RuntimeError as exc:
             print(f"[无法执行] {exc}")
             return 1
@@ -644,7 +656,7 @@ def cmd_heartbeat(args) -> int:
 def cmd_tools(args) -> int:
     """查看工具层：可用工具、权限档、调用账本。不调用模型、不花钱。
 
-    Phase 9 / project-spec §10 §30。权限从配置来，这里只如实展示。
+    Phase 9 / 总项目指令 §10 §30。权限从配置来，这里只如实展示。
     """
     import storage
     import tools as tools_mod
@@ -731,7 +743,7 @@ def cmd_ui(args) -> int:
 def cmd_router(args) -> int:
     """查看模型路由：哪个用途用哪个模型、为什么。不调用模型、不花钱。
 
-    Phase 10 / project-spec §11 §31。
+    Phase 10 / 总项目指令 §11 §31。
     """
     import model_router as router_mod
     from config import ConfigError, load_settings

@@ -50,6 +50,9 @@ import json
 from datetime import datetime, timezone
 
 from paths import SELF_MODEL_DIR, ensure_dirs
+import snapshots
+
+_SNAP_PREFIX = "model_v"
 
 STATUS_ACTIVE = "active"
 STATUS_SUPERSEDED = "superseded"
@@ -157,24 +160,17 @@ def new_id(belief: str, source: str) -> str:
 # ----------------------------------------------------------------------------
 
 def snapshot_path(version: int):
-    return SELF_MODEL_DIR / f"model_v{version:03d}.json"
+    return snapshots.path_for(SELF_MODEL_DIR, _SNAP_PREFIX, version)
 
 
 def existing_snapshots() -> list[int]:
-    if not SELF_MODEL_DIR.exists():
-        return []
-    out = []
-    for p in SELF_MODEL_DIR.glob("model_v*.json"):
-        try:
-            out.append(int(p.stem.split("_v")[1]))
-        except (IndexError, ValueError):
-            continue
-    return sorted(out)
+    # ensure=False：**不创建目录**，只在目录不存在时返回空列表
+    # —— 这是本模块原有行为，与 relationship / user_model 不同，显式保留。
+    return snapshots.scan_versions(SELF_MODEL_DIR, prefix=_SNAP_PREFIX, ensure=False)
 
 
 def next_snapshot_version() -> int:
-    ex = existing_snapshots()
-    return (max(ex) + 1) if ex else 1
+    return snapshots.next_version(existing_snapshots())
 
 
 def save_snapshot(items: list[dict], *, note: str = "") -> dict:
@@ -184,15 +180,12 @@ def save_snapshot(items: list[dict], *, note: str = "") -> dict:
     的真实事故，偷懒沿用同一个修正。
     """
     ensure_dirs()
-    version = next_snapshot_version()
-    path = snapshot_path(version)
-    for _ in range(1000):
-        if not path.exists():
-            break
-        version += 1
-        path = snapshot_path(version)
-    else:
-        raise SelfModelError(f"连续 1000 个快照号被占用：{path.name}")
+    # seek=True：撞号往后找空号（与 user_model 同策略；relationship 不这么做）
+    version, path, status = snapshots.resolve_version(
+        SELF_MODEL_DIR, prefix=_SNAP_PREFIX, seek=True
+    )
+    if status == "exhausted":
+        raise SelfModelError(f"连续 {snapshots.SCAN_LIMIT} 个快照号被占用：{path.name}")
 
     payload = {
         "version": f"v{version:03d}",
@@ -201,7 +194,7 @@ def save_snapshot(items: list[dict], *, note: str = "") -> dict:
         "items": items,
     }
     body = json.dumps(payload, ensure_ascii=False, indent=2)
-    sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    sha = snapshots.digest_of(body)
     path.write_text(body, encoding="utf-8")
     path.with_suffix(".json.sha256").write_text(sha + "\n", encoding="utf-8")
     return {"version": f"v{version:03d}", "file": path.name, "sha256": sha,

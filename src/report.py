@@ -1,9 +1,9 @@
 """生成「原始事实 vs 各记忆版本 vs 最终回忆」对比报告。
 
-这是实验的最终产出。判定口径以 `experiments/ground-truth-facts.md` 的基准为准。
+这是实验的最终产出。判定口径以 `experiments/人工标注事实清单.md` 的基准为准。
 
 用法：
-    python src\\report.py              输出到 experiments/comparison-report.md
+    python src\\report.py              输出到 experiments/对比报告.md
     python src\\report.py --print      同时打印到屏幕
 """
 
@@ -22,7 +22,7 @@ import storage  # noqa: E402
 from paths import EXPERIMENTS_DIR, RECALL_DIR, ensure_dirs  # noqa: E402
 
 
-# 基准事实的判定关键词。与 experiments/ground-truth-facts.md 同源，
+# 基准事实的判定关键词。与 experiments/人工标注事实清单.md 同源，
 # 改这里要同步改那份清单（清单本身由 seed_baseline.py 从 JSON 定义生成）。
 FACTS = [
     ("B1", "买的时间是「上个月」，地点是「花市」", ["花市"]),
@@ -77,7 +77,7 @@ def build_report() -> str:
         "# 记忆偏移实验 · 对比报告",
         "",
         "> 本文件由 `src/report.py` 自动生成。判定基准见",
-        "> `experiments/ground-truth-facts.md`。",
+        "> `experiments/人工标注事实清单.md`。",
         ">",
         "> **重要**：条目级 diff（changelog）不可靠 —— 模型每次整理会重新分段，",
         "> 条目之间不是一一对应关系。所以本报告以「基准事实存活率」为主要判据。",
@@ -204,7 +204,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     text = build_report()
-    out = EXPERIMENTS_DIR / "comparison-report.md"
+    out = EXPERIMENTS_DIR / "对比报告.md"
     out.write_text(text, encoding="utf-8")
     print(f"报告已生成：experiments/{out.name}")
     if args.show:

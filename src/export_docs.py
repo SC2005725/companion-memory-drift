@@ -65,11 +65,11 @@ def main() -> int:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     made.append(write_text("项目说明书.txt", md_to_text(readme)))
 
-    plan = (ROOT / "docs" / "feasibility.md").read_text(encoding="utf-8")
-    made.append(write_text("feasibility.txt", md_to_text(plan)))
+    plan = (ROOT / "docs" / "00-方案与可行性分析.md").read_text(encoding="utf-8")
+    made.append(write_text("方案与可行性分析.txt", md_to_text(plan)))
 
-    events = (ROOT / "experiments" / "candidate-events.md").read_text(encoding="utf-8")
-    made.append(write_text("candidate-events.txt", md_to_text(events)))
+    events = (ROOT / "experiments" / "候选事件-请选择一个.md").read_text(encoding="utf-8")
+    made.append(write_text("候选事件-请选择一个.txt", md_to_text(events)))
 
     # 待办说明本身就是纯文本，原样带一份
     todo = (ROOT / "待办-从这里开始.txt").read_text(encoding="utf-8")
