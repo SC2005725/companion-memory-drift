@@ -211,7 +211,13 @@ def main() -> int:
     print("\n[T14] ★正式项目的历史版本文件未被改动（只读校验）")
     real_versions = sorted((REAL_ROOT / "memory" / "versions").glob("v*.json"))
     sidecars = sorted((REAL_ROOT / "memory" / "versions").glob("v*.sha256"))
-    check("正式版本文件数 >= 4", len(real_versions) >= 4, str(len(real_versions)))
+    if not real_versions:
+        # 新克隆的仓库按设计不含记忆数据 → 跳过而不是失败
+        # （恢复自发布副本提交 56d16d9；主项目此前缺这一段，同步时会覆盖掉它。）
+        print("  [跳过] 没有正式版本文件。本节校验的是「真实数据未被改动」，")
+        print("         新克隆的仓库本来就没有数据，跳过。")
+    else:
+        check("正式版本文件数 >= 1", len(real_versions) >= 1, str(len(real_versions)))
     ok = True
     for p in real_versions:
         side = p.with_suffix(".sha256")

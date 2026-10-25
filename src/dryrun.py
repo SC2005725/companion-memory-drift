@@ -704,4 +704,21 @@ def write_report(results: list[dict], p_mem: dict, p_none: dict) -> Path:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ⚠️ **只跳过一种情况**：必需的公开测试夹具文件根本不存在。
+    #
+    # 公开仓库按设计不含实验夹具（受控定义文件，不是真实数据），
+    # 所以 clone 下来跑 dryrun 会因为缺文件而失败 —— 那与代码质量无关。
+    #
+    # 但**夹具坏了不算**：JSON 解析失败、字段缺失、其他 SeedError
+    # 一律照常抛出、照常失败。`FixtureMissing` 是 `SeedError` 的子类，
+    # 这里只捕获子类 —— 父类与其他异常会正常冒泡。
+    try:
+        raise SystemExit(main())
+    except seed_mod.FixtureMissing as exc:
+        print("=" * 74)
+        print("  [跳过] dryrun 需要实验夹具，而当前仓库不含它。")
+        print(f"         原因：{exc}")
+        print("         这不是失败 —— 公开仓库按设计不含实验夹具。")
+        print("         想跑它：在含 experiments/ 的项目里执行本文件。")
+        print("=" * 74)
+        raise SystemExit(0)

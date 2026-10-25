@@ -37,9 +37,30 @@ class SeedError(RuntimeError):
     pass
 
 
+class FixtureMissing(SeedError):
+    """**必需的测试夹具文件根本不存在**。
+
+    ## 为什么单独分一类
+
+    公开仓库**按设计不含**实验夹具（它是受控定义文件，不是真实数据）。
+    所以"文件不在"是一种**预期的、可跳过的**状态，不该让 CI 变红。
+
+    但**只有这一种**可以跳过。以下情况**仍然按 SeedError 失败**：
+
+      · 文件在，但 JSON 解析失败（`json.JSONDecodeError`，不是本类）
+      · 文件在，但缺少 `event_id` / `text` 字段（`KeyError`，不是本类）
+      · 任何其他异常
+
+    **跳过只针对"公开仓库没有这个夹具"，不针对"夹具坏了"。**
+    否则一个损坏的夹具会被静默当成"环境不支持"，把真问题藏起来。
+    """
+
+    pass
+
+
 def load_fixture() -> dict:
     if not FIXTURE_FILE.exists():
-        raise SeedError(f"缺少基准事件定义文件：{FIXTURE_FILE.as_posix()}")
+        raise FixtureMissing(f"缺少基准事件定义文件：{FIXTURE_FILE.as_posix()}")
     return json.loads(FIXTURE_FILE.read_text(encoding="utf-8"))
 
 
