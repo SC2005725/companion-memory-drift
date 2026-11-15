@@ -23,7 +23,7 @@ import json
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent
@@ -75,6 +75,32 @@ def check(name: str, good: bool, detail: str = "") -> None:
     CHECKS.append((name, bool(good), detail))
 
 
+def _persona_marks() -> tuple[str, ...]:
+    """当前对话可能用哪种人格标记（PX-1：不再硬编码「小满」）。
+
+    鹤辞主体下 `chat.build_messages` 优先用 `core/persona-heci.json` 渲染的人格，
+    第一句是「你是鹤辞。」；小满主体下是 persona 文件里的「你叫小满」。
+    断言只关心「人格段在不在」，不该锁死某一个人的名字。
+    """
+    marks: list[str] = []
+    try:
+        import core_persona
+
+        p = core_persona.load_persona()
+        if p and p.get("name"):
+            n = str(p["name"])
+            marks += [f"你是{n}", f"你叫{n}"]
+    except Exception:  # noqa: BLE001
+        pass
+    marks += ["你叫小满", "你是小满"]
+    return tuple(marks)
+
+
+def _has_persona(texts) -> bool:
+    marks = _persona_marks()
+    return any(any(m in t for m in marks) for t in texts)
+
+
 class FakeChat:
     """不联网的假客户端。记录每次实际发出的 messages，供注入检查。"""
 
@@ -119,6 +145,14 @@ def setup_files() -> None:
 
 
 def main() -> int:
+    # Windows GBK 控制台打不出 emoji（⏰ 提醒消息会进 check 详情）→ 不可编码字符
+    # 替换为 ?，别让测试崩在「打印结果」而不是「断言本身」。不改 encoding，
+    # 只放宽 errors，避免重新包装 stdout 的孤儿句柄问题。
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - 环境差异兜底
+            pass
     print("=" * 68)
     print("Phase 6（关系）+ Phase 7（用户模型）离线自测")
     print(f"隔离临时目录：{TEMP_ROOT}")
@@ -290,7 +324,7 @@ def main() -> int:
     # ⚠️ Phase 11 人格协同新增「表达调整」段，所以层数从 3 变 4。
     # 断言改成**按内容核对每层都在**，避免以后每加一层就改一次数字。
     check("人格 + 关系 + 用户模型三层都在",
-          any("你叫小满" in t for t in sys_texts2)
+          _has_persona(sys_texts2)
           and any("你与用户的关系" in t for t in sys_texts2)
           and any("你对用户的理解" in t for t in sys_texts2),
           f"system 段数={len(sys_texts2)}")
@@ -318,7 +352,7 @@ def main() -> int:
     chat.send_once(session, "那盆茉莉怎么样了", echo=lambda *_: None)
     sys_texts3 = [m["content"] for m in fake.messages[-1] if m["role"] == "system"]
     check("有记忆版本时五层上下文齐备（人格+表达调整+记忆+关系+用户模型）",
-          any("你叫小满" in t for t in sys_texts3)
+          _has_persona(sys_texts3)
           and any("表达调整" in t for t in sys_texts3)
           and any("你记得的关于用户的事" in t for t in sys_texts3)
           and any("你与用户的关系" in t for t in sys_texts3)
@@ -602,6 +636,292 @@ def main() -> int:
           len(storage.list_heartbeat_runs(conn)) == before_dry,
           f"{before_dry} → {len(storage.list_heartbeat_runs(conn))}")
     print(f"  dry-run 后心跳记录数不变（{before_dry}）")
+
+    # --- ★ 2026-10-26 新增：maybe_tick 也必须支持 dry_run（污染修复的回归测试）---
+    #
+    # ## 这是一次真实事故的回归测试
+    #
+    # `selftest.py` 的端到端自测会调 `chat.send_once()`，而 `send_once` 会调
+    # 本路径（`chat.maybe_heartbeat_tick` → `heartbeat.maybe_tick`）。
+    # 修复前 `maybe_tick` **没有透传 `dry_run`**，于是：
+    #
+    #   `status_snapshot.py` 每跑一次 → 往真实库写入 1 条 heartbeat_runs
+    #   → 且当判定为 proactive 时，还写入 1 条 pending_actions（status=delivered）
+    #
+    # 后果：`pending_actions` 曾显示 **2** 条「已投递主动消息」，
+    # 而**真实用户可见的只有 1 条** —— 被污染的那条从未送达任何人。
+    # 这两张表没有 `session_id`，既无法归属、也无法被 `_clean` 清掉。
+    #
+    # 修法：让 `maybe_tick` 透传 `dry_run`（判定照走、不落盘），
+    # 而不是「生成后再删记录」——后者会误删且依赖「能识别出测试行」。
+    print("\n[P8.11b] maybe_tick 的 dry_run 不写心跳、也不写待处理项")
+    before_mt = len(storage.list_heartbeat_runs(conn))
+    before_pa = len(storage.list_pending_actions(conn, status=None))
+
+    # 先把节流清掉：maybe_tick 会因 MIN_GAP_MINUTES 直接返回 throttled，
+    # 那样就测不到「真的执行了但没写」这条关键路径。
+    # 传**朴素** datetime 即可 —— maybe_tick 内部会补上 tzinfo。
+    far_future = datetime.now() + timedelta(hours=48)
+    r_mt = hb_mod.maybe_tick(session, now=far_future, dry_run=True)
+
+    after_mt = len(storage.list_heartbeat_runs(conn))
+    after_pa = len(storage.list_pending_actions(conn, status=None))
+    check("maybe_tick(dry_run) 不新增心跳记录", after_mt == before_mt,
+          f"{before_mt} → {after_mt}")
+    check("maybe_tick(dry_run) 不新增待处理项", after_pa == before_pa,
+          f"{before_pa} → {after_pa}")
+    check("maybe_tick(dry_run) 仍真的跑到了执行路径（不是被节流掉）",
+          r_mt.get("status") == hb_mod.TICK_EXECUTED
+          and r_mt.get("dry_run") is True,
+          f"status={r_mt.get('status')} dry_run={r_mt.get('dry_run')}")
+    check("dry_run 的结果里不含 result（没有落盘记录）",
+          r_mt.get("result") is None or r_mt.get("dry_run") is True, "")
+    print(f"  status={r_mt.get('status')} · 心跳 {before_mt}→{after_mt} · "
+          f"待处理 {before_pa}→{after_pa}")
+
+    # --- ★ 2026-11-07 新增：pending 不得短路整次心跳（HB-0 修复回归）---
+    #
+    # ## 这是一次真实缺陷的回归测试
+    #
+    # 2026-11-04 的 maybe_tick 把「已有 pending」短路放在节流**之前**：
+    # 只要存在 1 条未兑现 pending，就直接 return、**一条 heartbeat_runs 都不写**。
+    # 后果（dsh 复核 A1 时发现、ZCode 2026-11-06 确认）：
+    #   · pending 未兑现期间「上次检查时间」冻结 → 节流失真、监控全盲；
+    #   · schedule 触发一旦启用（TRIGGER_SCHEDULE 预留位），会被一条卡住的
+    #     pending **永久挡死**——主动心跳彻底停摆。
+    # 修法：节流先行；pending 存在时照常 tick 并留痕，但压制新的主动意图
+    #   （suppress_new_intent → 决策降级为 wait，action=pending_deferred）。
+    print("\n[P8.11c] pending 存在时心跳照常检查留痕，且不重复生成主动意图")
+    _seed_run = storage.record_heartbeat_run(
+        conn, decision="no_action", reason="P8.11c 种子 run：给 pending 一个合法 run_id")
+    _pa_id = storage.record_pending_action(
+        conn, run_id=_seed_run, kind="followup_question",
+        message="P8.11c 测试用未兑现主动意图", reason="回归测试")
+    before_runs_c = len(storage.list_heartbeat_runs(conn))
+    before_pend_c = len(storage.list_pending_actions(conn, status="pending"))
+
+    # 场景1：pending 存在 + 距上次检查 ≥ MIN_GAP（now 抬到 48h 后，必过节流）
+    #   → 期望：照常执行（executed=True）、run +1、pending 不新增、决策非 proactive
+    r_c1 = hb_mod.maybe_tick(session, now=datetime.now() + timedelta(hours=48),
+                             trigger=hb_mod.TRIGGER_SCHEDULE)
+    after_runs_c = len(storage.list_heartbeat_runs(conn))
+    after_pend_c = len(storage.list_pending_actions(conn, status="pending"))
+    check("pending 存在时心跳照常执行（不再短路装死）",
+          r_c1["status"] == hb_mod.TICK_PENDING_ACTION and r_c1["executed"] is True,
+          f"status={r_c1['status']} executed={r_c1.get('executed')}")
+    check("heartbeat_runs 照常 +1（留痕恢复，不再停更）",
+          after_runs_c == before_runs_c + 1, f"{before_runs_c} → {after_runs_c}")
+    check("不重复生成：pending 数不变", after_pend_c == before_pend_c,
+          f"{before_pend_c} → {after_pend_c}")
+    check("压制的决策不是 proactive_message",
+          r_c1["result"]["decision"] != "proactive_message",
+          r_c1["result"]["decision"])
+    if r_c1["result"].get("action") == "pending_deferred":
+        check("降级理由指向已有的 pending",
+              "不重复生成" in r_c1["result"]["reason"],
+              r_c1["result"]["reason"][:46])
+
+    # 场景2：刚检查过（30 秒前，run 落库打的是真实时间）再触发 → 节流胜出，
+    #   pending 也不能让它提前（节流先行的回归）。
+    #   ⚠️ 这里必须传**带时区**的 UTC 时间：heartbeat_runs 落库的是真实 UTC，
+    #   而朴素 datetime.now()（本地时间）会被 maybe_tick 补成 UTC —— 本机
+    #   UTC+8，朴素传入等于把 now 拔快 8 小时，30 秒的间隔瞬间变 8 小时，
+    #   节流就永远测不到（本测试第一版就栽在这里）。
+    r_c2 = hb_mod.maybe_tick(
+        session, now=datetime.now(timezone.utc) + timedelta(seconds=30),
+        trigger=hb_mod.TRIGGER_SCHEDULE)
+    check("节流先行：间隔内再触发 → throttled（不因 pending 提前）",
+          r_c2["status"] == hb_mod.TICK_THROTTLED, f"status={r_c2['status']}")
+
+    # 清场：把测试 pending 划为 delivered，不影响后续用例
+    storage.mark_pending_delivered(conn, _pa_id, "P8.11c")
+    print(f"  r1.status={r_c1['status']} 决策={r_c1['result']['decision']} · "
+          f"心跳 {before_runs_c}→{after_runs_c} · pending {before_pend_c}→{after_pend_c}（已清场）")
+
+    # --- ★ 2026-11-07（外部调研 #6/#7）：digest 合并 + 定时承诺兑现 ---
+    #
+    # #6：多条没说出口的意图 → 合并成一次推送（限流+防打扰），全部划掉
+    # #7：kind=scheduled_reminder 且 deliver_at 到点 → 不经 decide() 直接兑现
+    #     （提醒是用户自己约的，免打扰时段也照送）；未到点的不动
+    # 顺带验证 schedule 触发路径（TRIGGER_SCHEDULE 第一次有生产者）
+    print("\n[P8.12] 通知 digest 合并 + 定时承诺兑现 + schedule 触发")
+    import os as _os
+    from datetime import timezone as _tz2
+
+    _os.environ["NTFY_TOPIC"] = "selftest-topic"
+    captured: list[tuple[str, str]] = []
+    _real_deliver = hb_mod.deliver_to_ntfy
+    hb_mod.deliver_to_ntfy = lambda topic, message: (captured.append((topic, message)) or True)
+    _quiet_backup = hb_mod._in_quiet_hours
+    _pf_backup = hb_mod.pick_followup
+    hb_mod._in_quiet_hours = lambda *a, **k: False
+    hb_mod.pick_followup = lambda context, rules: {
+        "reason": "P8.12 测试：有值得跟进的话题", "kind": "followup_question",
+        "message": "这轮的新想法"}
+    try:
+        _seed_run12 = storage.record_heartbeat_run(
+            conn, decision="no_action", reason="P8.12 种子 run")
+        # 场景1 digest：先塞 1 条旧 pending，新一轮 proactive 推送时应合并全部
+        storage.record_pending_action(conn, run_id=_seed_run12, kind="followup_question",
+                                      message="上次你说的那本书", reason="P8.12 旧意图")
+        r_d1 = hb_mod.tick(conn, settings,
+                           now=datetime.now(_tz2.utc) + timedelta(hours=48),
+                           trigger=hb_mod.TRIGGER_SCHEDULE)
+        check("digest：多条 pending 合并为一次推送",
+              any("上次你说的那本书" in m and "这轮的新想法" in m for _, m in captured),
+              str(captured)[:120])
+        left = storage.list_pending_actions(conn, status="pending")
+        check("digest：相关 pending 全部划掉（pushed）",
+              all(r["status"] == "pushed" for r in left
+                  if r["kind"] == "followup_question"), str(len(left)))
+        check("schedule 触发留痕：run 的 context 带 trigger=schedule",
+              any("schedule" in (r["context"] or "")
+                  for r in storage.list_heartbeat_runs(conn, limit=3)),
+              str([r["decision"] for r in storage.list_heartbeat_runs(conn, limit=3)]))
+
+        # 场景2 定时承诺：到点的提醒 → 不经 decide() 直接兑现；未到点的不动
+        captured.clear()
+        due_iso = (datetime.now(_tz2.utc) - timedelta(minutes=5)).isoformat()
+        fut_iso = (datetime.now(_tz2.utc) + timedelta(hours=6)).isoformat()
+        _pa_due = storage.record_pending_action(
+            conn, run_id=_seed_run12, kind="scheduled_reminder",
+            message="明早叫我开会", reason="定时承诺", deliver_at=due_iso)
+        _pa_fut = storage.record_pending_action(
+            conn, run_id=_seed_run12, kind="scheduled_reminder",
+            message="三天后提醒我复查", reason="定时承诺", deliver_at=fut_iso)
+        r_d2 = hb_mod.tick(conn, settings, now=datetime.now(_tz2.utc),
+                           trigger=hb_mod.TRIGGER_SCHEDULE)
+        check("到点提醒不经 decide() 直接兑现",
+              any("明早叫我开会" in m for _, m in captured), str(captured))
+        st_due = [r["status"] for r in storage.list_pending_actions(conn, status=None)
+                  if r["pending_id"] == _pa_due][0]
+        check("到点提醒标记 pushed", st_due == "pushed", st_due)
+        st_fut = [r["status"] for r in storage.list_pending_actions(conn, status=None)
+                  if r["pending_id"] == _pa_fut][0]
+        check("未到点提醒保持 pending", st_fut == "pending", st_fut)
+
+        # 场景3 提醒缓存同步（工单二：断机期兜底的本地半边）
+        # 每次 tick 把未兑现的定时承诺写成根目录 reminders.json，云端 cron 读它兜底
+        _rem_file = Path(paths.ROOT) / "reminders.json"
+        check("reminders.json 已写（断机期兜底通道）", _rem_file.exists(),
+              str(_rem_file))
+        _data = json.loads(_rem_file.read_text(encoding="utf-8"))
+        _ids = [r["pending_id"] for r in _data["reminders"]]
+        check("未来提醒在清单里", _pa_fut in _ids, str(_ids))
+        check("已兑现（pushed）的不在清单里", _pa_due not in _ids, str(_ids))
+        _entry = [r for r in _data["reminders"] if r["pending_id"] == _pa_fut][0]
+        check("条目带 deliver_at/message/kind",
+              bool(_entry["deliver_at"]) and bool(_entry["message"])
+              and _entry["kind"] == "scheduled_reminder",
+              str(_entry))
+    finally:
+        hb_mod.deliver_to_ntfy = _real_deliver
+        hb_mod._in_quiet_hours = _quiet_backup
+        hb_mod.pick_followup = _pf_backup
+        if _os.environ.get("NTFY_TOPIC") == "selftest-topic":
+            del _os.environ["NTFY_TOPIC"]
+    print(f"  测试期推送 {len(captured)} 条 · monkeypatch 已还原")
+
+    # --- ★ 2026-11-07（雷2/3 回归）：未到点提醒不进 chat 清单、不进 digest ---
+    print("\n[P8.14] 雷2/3 回归：双路径过滤")
+    _pa_due14 = storage.record_pending_action(
+        conn, run_id=_seed_run12, kind="scheduled_reminder",
+        message="已到点的提醒", reason="P8.14", deliver_at=(
+            datetime.now(_tz2.utc) - timedelta(minutes=1)).isoformat())
+    _pa_fut14 = storage.record_pending_action(
+        conn, run_id=_seed_run12, kind="scheduled_reminder",
+        message="三天后的提醒", reason="P8.14", deliver_at=(
+            datetime.now(_tz2.utc) + timedelta(days=3)).isoformat())
+    _ids14 = [r["pending_id"] for r in storage.list_pending_for_chat(conn)]
+    check("chat 清单：未到点提醒不在（不被提前消费）", _pa_fut14 not in _ids14, str(_ids14))
+    check("chat 清单：到点提醒在（到点就该说）", _pa_due14 in _ids14, str(_ids14))
+
+    _os.environ["NTFY_TOPIC"] = "selftest-topic"
+    captured.clear()
+    # 2026-11-07 修复：P8.13 的 finally 已把 deliver_to_ntfy 还原成真函数，
+    # 这里必须重新打桩，否则 tick 走真实 HTTP 推送（沙箱里失败 → captured=0）。
+    hb_mod.deliver_to_ntfy = lambda topic, message: (captured.append((topic, message)) or True)
+    hb_mod._in_quiet_hours = lambda *a, **k: False
+    hb_mod.pick_followup = lambda context, rules: {
+        "reason": "P8.14", "kind": "followup_question", "message": "P8.14 新意图"}
+    try:
+        # 清场：前面场景遗留的 pending 会让 decide 的防刷屏规则（≥3 条）拦住
+        # proactive——测试要的是受控环境，先把账清干净再种测试数据。
+        for r in storage.list_pending_actions(conn, status="pending"):
+            storage.mark_pending_delivered(conn, r["pending_id"], "P8.14-cleanup")
+        r14 = hb_mod.tick(conn, settings, now=datetime.now(_tz2.utc) + timedelta(hours=48),
+                    trigger=hb_mod.TRIGGER_SCHEDULE)
+        merged_all = " ｜ ".join(m for _, m in captured)
+        check("digest：未到点提醒不被合并推送", "三天后的提醒" not in merged_all,
+              merged_all[:100])
+        check("digest：proactive 意图正常合并", "P8.14 新意图" in merged_all,
+              merged_all[:80])
+    finally:
+        hb_mod.deliver_to_ntfy = _real_deliver
+        hb_mod._in_quiet_hours = _quiet_backup
+        hb_mod.pick_followup = _pf_backup
+        if _os.environ.get("NTFY_TOPIC") == "selftest-topic":
+            del _os.environ["NTFY_TOPIC"]
+    storage.mark_pending_delivered(conn, _pa_due14, "P8.14")
+    storage.mark_pending_delivered(conn, _pa_fut14, "P8.14")
+    print("  双路径过滤验证完成 · monkeypatch 已还原")
+
+    # --- P8.15（P1 批回归，2026-11-08）：ntfy 4KB 护栏 + deliver_at 解析后比较 ---
+    print("\n[P8.15] P1 回归：ntfy 4KB 护栏 + deliver_at 解析后比较")
+    import urllib.request as _ur15
+    from datetime import timezone as _tz15
+    _real_urlopen15 = _ur15.urlopen
+    _sent15: dict = {}
+
+    class _FakeResp15:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    def _fake_urlopen15(req, timeout=None):
+        _sent15["data"] = req.data.decode("utf-8")
+        return _FakeResp15()
+
+    _ur15.urlopen = _fake_urlopen15
+    try:
+        _big15 = "很长的主动消息。" * 800   # 5600 字 > ntfy 4096 上限
+        _ok15 = hb_mod.deliver_to_ntfy("selftest-topic", _big15)
+        check("超长消息仍推送成功（截断护栏，不再永久卡 pending）",
+              _ok15 is True
+              and len(_sent15.get("data", "")) <= hb_mod.NTFY_MAX_MESSAGE_CHARS + 60,
+              f"len={len(_sent15.get('data', ''))}")
+        check("截断带说明尾注（全文在本地账可查）",
+              "超长已截断" in _sent15.get("data", ""), "")
+        _ok15b = hb_mod.deliver_to_ntfy("selftest-topic", "正常长度")
+        check("正常消息原样不截断",
+              _ok15b is True and _sent15.get("data") == "正常长度",
+              str(_sent15.get("data", ""))[:40])
+    finally:
+        _ur15.urlopen = _real_urlopen15
+
+    # deliver_at：P1 前 SQL 字符串比较，"+08:00" 格式永远判未到点（迟送 6.5h+）
+    _pa_0815 = storage.record_pending_action(
+        conn, run_id=_seed_run12, kind="scheduled_reminder",
+        message="北京时区到点提醒", reason="P8.15",
+        deliver_at="2026-11-09T12:00:00+08:00")   # = 04:00 UTC
+    _due15 = storage.list_due_reminders(conn, "2026-11-09T05:00:00+00:00")
+    check("+08:00 格式被判到点（解析后比较，不再字典序误判）",
+          _pa_0815 in [r["pending_id"] for r in _due15],
+          str([r["pending_id"] for r in _due15]))
+    _notdue15 = storage.list_due_reminders(conn, "2026-11-09T03:00:00+00:00")
+    check("未到点不误判（提前 1 小时不算到）",
+          _pa_0815 not in [r["pending_id"] for r in _notdue15], "")
+    _row15 = [r for r in storage.list_pending_actions(conn, status=None)
+              if r["pending_id"] == _pa_0815][0]
+    check("入库归一成 UTC ISO（写侧格式不再影响读侧）",
+          str(_row15["deliver_at"]).endswith("+00:00"), str(_row15["deliver_at"]))
 
     # ========================================================================
     # 身份信息捕获（真实事故的回归测试）

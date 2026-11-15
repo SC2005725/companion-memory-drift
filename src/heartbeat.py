@@ -8,15 +8,23 @@
 2. **主动行动 ≠ 每隔几分钟发消息。** §8 的原话。所以规则默认结论是**不行动**。
 3. **「选择不行动」本身也是 Agency。** §29 的原话。所以 `no_action` 也会落盘留痕。
 
-## 一个必须如实说明的限制
+## 投递通道：从「没有」到「可选」
 
-本项目是**命令行聊天，没有投递通道** —— 小满无法主动给用户发消息。
+**2026-10-28 之前**：本项目是命令行聊天，**没有投递通道** —— `proactive_message`
+只是一条「主动意图」，写进 `pending_actions`，等你下次开口时注入。
 
-所以 `proactive_message` 在实现上是一条**「主动意图」**，写进 `pending_actions`，
-等用户下次开口时注入上下文。她可以说「上次我想起你提过…」，
-但**不会有凭空弹出来的消息**。
+**2026-10-28 起**：加了 **ntfy 可选投递**（`deliver_to_ntfy`）。行为变成：
 
-**我不假装能做到做不到的事。** 真要做到推送，得先有投递渠道（Phase 9 的 Tool 层或外部 API）。
+    判定 proactive_message
+      → ① 先写 pending_actions（**留痕在前**，投递失败也不丢意图）
+      → ② 再看环境变量 `NTFY_TOPIC` 有没有值
+           · 没值 → 到此为止，与旧行为完全一致
+           · 有值 → 顺带推一条到手机（失败只记日志，绝不影响心跳）
+
+**默认就是关的** —— 不设 `NTFY_TOPIC` 就等于旧行为。所以这不是「默认开始推送」。
+
+**仍然不假装的事**：投递成功只代表 ntfy.sh 收下了，**不代表手机收到**。
+「手机真的弹出」只能由人确认，代码无法自证。
 
 ## 决策流程（§8）
 
@@ -127,7 +135,11 @@ def collect_context(conn, settings, *, now: datetime | None = None) -> dict:
     rel_state = relationship_mod.current_state(conn, settings.relationship or {})
     um_items = user_model_mod.load_items()
     um_active = user_model_mod.active_items(um_items)
-    pending = storage.list_pending_actions(conn, status="pending")
+    # 定时承诺（scheduled_reminder）不算「主动意图积压」——它们是承诺过的
+    # 送达，到点自有 reminder 通道兑现；计入积压会让规则 2 被提醒误触发，
+    # 用户有几个未响的提醒，鹤辞就永远不再主动说话（2026-11-07，探针实测）。
+    pending = [p for p in storage.list_pending_actions(conn, status="pending")
+               if p["kind"] != "scheduled_reminder"]
 
     last_hb = storage.list_heartbeat_runs(conn, limit=1)
     last_proactive_at = None
@@ -271,6 +283,17 @@ def decide(context: dict, rules: dict) -> dict:
     }
 
 
+# 关怀模板池（独立体检第 2 条修复，2026-11-15）：确定性轮换，零模型调用。
+# 语料刻意保持「她的口吻」：简短、不腻、不问两个问题——与人格卡的表达约束一致。
+_CARE_TEMPLATES = (
+    "想起之前我们一起弄成的那件事了，你那边后来还顺利吗？",
+    "上次一起把事情搞定的感觉还挺怀念的。你最近还好吗？",
+    "翻记忆的时候看到我们一块儿想办法的那段了。你这边一切都还顺？",
+    "想起咱们从头到尾一起磨完一件事的时候了。最近有什么新进展吗？",
+    "之前那段一起解决问题的日子挺难得的。你最近过得怎么样？",
+)
+
+
 def pick_followup(context: dict, rules: dict) -> dict | None:
     """挑一个值得跟进的话题。**优先复用已有的关系/用户模型/记忆数据**，不另造。
 
@@ -292,13 +315,97 @@ def pick_followup(context: dict, rules: dict) -> dict | None:
 
     rel = context.get("relationship") or {}
     if rel.get("stage") in ("信任", "亲近") and rel.get("counts", {}).get("shared_experience"):
+        # 独立体检第 2 条（2026-11-15）：关怀推送**模板轮换**。
+        # 旧版硬编码一句话 → 8 天 11 次推送全是同一句（dsh 11-04 预警的
+        # 「复读」应验）。轮换 = 确定性（日期×6h 桶取模），**零模型调用**，
+        # 5 条模板 30 小时一循环——相邻两次推送不再是同一句。
+        from datetime import datetime as _dt
+
+        idx = (_dt.now().toordinal() * 4 + _dt.now().hour // 6) % len(_CARE_TEMPLATES)
         return {
             "kind": "relationship_care",
             "reason": f"关系已到「{rel.get('stage')}」且有过共同经历，可以主动关心一下",
-            "message": "想起之前我们一起弄成的那件事了，你那边后来还顺利吗？",
+            "message": _CARE_TEMPLATES[idx],
         }
 
     return None
+
+
+# ----------------------------------------------------------------------------
+# ntfy 手机投递（2026-10-28 加）
+#
+# 为什么单独成函数、而且和 `tick` 解耦：
+# **投递是可失败的旁路，不该混进决策主干。** 心跳的职责是「判定 + 留痕」；
+# 能不能推出去是另一件事。所以这里所有异常都吞掉，`tick` 拿到的返回不受影响。
+#
+# 为什么用环境变量而不是 settings.json：
+# 只改一个文件就够了（用户授权范围就是只动 heartbeat.py）。
+# 而且 topic 属于**本机凭据**，放环境变量不必进版本库。
+# ----------------------------------------------------------------------------
+
+NTFY_ENV_KEY = "NTFY_TOPIC"        # 环境变量名（.env 里的同名键也会被 load_env 读进来）
+NTFY_URL_BASE = "https://ntfy.sh"
+NTFY_TIMEOUT_S = 10.0              # 够慢网络用，又不至于让心跳卡住
+# P1（ntfy 4KB 护栏，2026-11-08）：ntfy 单条 message 上限 4096 字符，超长推送
+# 永远失败 → digest 里那条 pending 永远推不出也永远不划掉 → 主动推送整体冻结。
+# 护栏 = 发送前截断留余量；全文仍在 pending_actions / 任务账里可查。
+NTFY_MAX_MESSAGE_CHARS = 3800
+
+
+def ntfy_topic_from_env() -> str:
+    """从环境变量取 topic。**空串 = 不投递** —— 这就是开关，不需要额外配置项。"""
+    import os
+
+    return (os.environ.get(NTFY_ENV_KEY) or "").strip()
+
+
+def deliver_to_ntfy(topic: str, message: str) -> bool:
+    """把一条主动消息推到 ntfy。**任何异常都不会抛出去。**
+
+    三条纪律：
+      1. **不阻断心跳** —— 投递失败只是少一条通知，`tick` 必须照常落盘与返回
+      2. **不重试** —— 一次失败就丢。断网时重试会变成风暴，而这条消息
+         本来就已经写进 `pending_actions` 了，不会真的丢
+      3. **不泄漏 topic** —— 日志只记成功/失败与状态码，**不记 topic 本身**，
+         异常信息也只记类型名
+
+    返回值只用于留痕，调用方不必关心。
+    """
+    if not topic or not message:
+        return False
+    if len(message) > NTFY_MAX_MESSAGE_CHARS:
+        # P1（4KB 护栏）：截断发送，保证「能推出去、能划掉」，不再永久卡 pending。
+        message = (message[:NTFY_MAX_MESSAGE_CHARS].rstrip()
+                   + "\n…（超长已截断：ntfy 单条上限；全文在本地 pending_actions 可查）")
+    try:
+        import urllib.request
+        from urllib.parse import quote
+
+        req = urllib.request.Request(
+            f"{NTFY_URL_BASE}/{quote(topic, safe='')}",
+            # ★ 显式 UTF-8 字节 —— 实测过：PowerShell 那条路会把中文发成乱码，
+            #   Python 这条不会。别改成 str 直传。
+            data=message.encode("utf-8"),
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                # 头只用 ASCII：HTTP 头按 latin-1 编码，中文标题会出错。
+                # 中文正文放 body，那里是 UTF-8，没有问题。
+                "Title": "Companion",
+                "Priority": "default",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT_S) as resp:
+            ok = 200 <= resp.status < 300
+            storage.log_line(f"heartbeat ntfy: ok={ok} status={resp.status}")
+            return ok
+    except Exception as exc:                       # noqa: BLE001
+        # 可能是 URLError / HTTPError / 代理 / 证书 / DNS —— 类型不可穷举，
+        # 所以捕 Exception。**这里绝不能再抛**，否则会打断心跳。
+        storage.log_line(
+            f"heartbeat ntfy: FAILED {type(exc).__name__}（已忽略，不影响心跳）"
+        )
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -306,13 +413,18 @@ def pick_followup(context: dict, rules: dict) -> dict | None:
 # ----------------------------------------------------------------------------
 
 def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
-         trigger: str = TRIGGER_MANUAL) -> dict:
+         trigger: str = TRIGGER_MANUAL, suppress_new_intent: bool = False) -> dict:
     """跑一次心跳检查：收集状态 → 决策 → 落盘。
 
     `dry_run=True` 时只算不写，方便查看「如果现在检查，会怎么决定」。
 
     `trigger` 记录**这次检查是被谁触发的**（manual / chat / schedule）——
     只为可追溯，不改变任何判定逻辑（`decide` 是纯函数，不看 trigger）。
+
+    `suppress_new_intent=True`（2026-11-07，HB-0）：已有未兑现的主动意图时，
+    本轮检查**照常执行与留痕**，但不生成新的主动意图 —— 若 decide 判出
+    proactive_message，就地降级为 wait（action=pending_deferred）。
+    「不重复生成」的语义由这一参数承担，`maybe_tick` 不再为此整体短路。
 
     **注意**：本函数不调用模型，不花钱。
     落盘时会显式记下 `model_called: False`，让"这次到底花没花钱"可事后核对。
@@ -322,8 +434,74 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
         raise RuntimeError("settings.json 里没有 heartbeat 规则，无法执行心跳")
 
     trigger = trigger if trigger in TRIGGERS else TRIGGER_MANUAL
+
+    # —— 定时承诺兑现（2026-11-07，外部调研 #7）——
+    # kind=scheduled_reminder 且 deliver_at 到点的条目，**独立于 decide() 兑现**：
+    # 提醒是用户/鹤辞自己约的（"明早8点叫我"），到点就送，免打扰时段也不拦。
+    # ntfy 未配置 → 留在 pending，等 chat 注入兑现（render_for_prompt）。
+    # 全程 try/except：提醒失败绝不打断心跳主干（与 ntfy 旁路同纪律）。
+    # **必须先于 collect_context**：兑现会改变 pending 计数，旧顺序让 decide
+    # 拿到过期计数（雷 2/3 的完整修法，2026-11-07 探针实测）。
+    if not dry_run:
+        try:
+            now_dt = now or datetime.now(timezone.utc)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+            due = storage.list_due_reminders(
+                conn, now_dt.astimezone(timezone.utc).isoformat())
+            for r in due:
+                _rtopic = ntfy_topic_from_env()
+                if not _rtopic:
+                    break  # 无投递通道 → 留给 chat 注入兑现
+                if deliver_to_ntfy(_rtopic, f"⏰ {r['message']}"):
+                    storage.mark_pending_pushed(conn, r["pending_id"])
+                    storage.log_line(
+                        f"heartbeat reminder: {r['pending_id']} 已兑现 → pushed")
+        except Exception as exc:  # noqa: BLE001
+            storage.log_line(
+                f"heartbeat reminder: 兑现失败（不影响心跳）{type(exc).__name__}: {exc}")
+
+        # —— 提醒缓存同步（2026-11-07，云端工单二：断机期兜底的本地半边）——
+        # 把未兑现的定时承诺（kind=scheduled_reminder，deliver_at 在 48h 窗口内）
+        # 全量写成根目录 reminders.json。云端 cron 读它做「主机关机期间的兜底送信」；
+        # 主机在线时云端让路（先探 health），本地仍是主通道。每次 tick 全量覆盖。
+        # 云端纪律见 docs/云端工单-两件-20261107.md 工单二：只送提醒、幂等、不闲聊。
+        try:
+            from datetime import timedelta as _td
+            from paths import ROOT as _root
+
+            _cutoff = (datetime.now(timezone.utc) + _td(hours=48)).isoformat()
+            _rows = storage.list_pending_reminders_window(conn, cutoff=_cutoff)
+            _payload = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "window_hours": 48,
+                "reminders": [
+                    {"pending_id": r["pending_id"], "deliver_at": r["deliver_at"],
+                     "message": r["message"], "kind": r["kind"]}
+                    for r in _rows
+                ],
+            }
+            (_root / "reminders.json").write_text(
+                json.dumps(_payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            storage.log_line(
+                f"heartbeat reminders-sync: 失败（不影响心跳）{type(exc).__name__}: {exc}")
+
+    # 上下文收集放在兑现**之后**：decide 拿到的是兑现后的真实计数
     context = collect_context(conn, settings, now=now)
     result = decide(context, rules)
+
+    # —— 压制重复生成（2026-11-07，HB-0）——
+    # 放在 decide 之后、落盘之前：decide 是**纯函数**（不查库），不改它；
+    # 降级只影响「这条决策怎么落盘」，判定链路的可重放性不受影响。
+    # wait 是既有决策值（storage.HEARTBEAT_DECISIONS），**不动枚举与表结构**。
+    if suppress_new_intent and result["decision"] == "proactive_message":
+        result = {**result,
+                  "decision": "wait",
+                  "reason": (f"已有 {context.get('pending_count') or 0} 条未兑现主动意图，"
+                             f"本轮不重复生成（原意图先兑现再说）"),
+                  "action": "pending_deferred",
+                  "message": ""}
 
     if dry_run:
         return {**result, "context": context, "run_id": None, "pending_id": None,
@@ -358,6 +536,42 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
         storage.log_line(
             f"heartbeat proactive: {pending_id} kind={result['action']} reason={result['reason']}"
         )
+        # —— 已经决定要说了，顺带推一条到手机 ——
+        #
+        # **顺序是有意的**：先 `record_pending_action`（留痕），再投递。
+        # 这样即使投递失败，这条意图也已经落进 `pending_actions`，不会丢。
+        # 反过来（先投递再落盘）在投递失败时会留下"发过但没记录"的不一致。
+        #
+        # `NTFY_TOPIC` 没设 → 直接跳过，与旧行为完全一致。
+        _topic = ntfy_topic_from_env()
+        if _topic:
+            # 2026-11-04：推成功了就把这条从「欠着没说」里划掉（status=pushed）。
+            # 不这么做的话：定时心跳每次都会看到一条 pending，然后直接退出，
+            # 「主动」就只响一次。详见 storage.mark_pending_pushed 的说明。
+            # 注意：推送失败**不划掉**，保证下次还能再试一次，意图不丢。
+            #
+            # 2026-11-07（外部调研 #6）：digest 合并——已有多条没说出口的意图时，
+            # 合并成**一次**推送（移动推送限流 + 防打扰双重要求），全部划掉。
+            # 2026-11-07（雷 2 修复）：digest 只合并 proactive 意图——
+            # scheduled_reminder 有自己的到点兑现通道（tick 开头的 reminder 块），
+            # 混进 digest 会被提前推走并标 pushed，到点永不兑现。
+            all_pending = [p for p in storage.list_pending_actions(conn, status="pending")
+                           if p["kind"] != "scheduled_reminder"]
+            if len(all_pending) > 1:
+                merged = "；\n".join(dict.fromkeys(
+                    (p["message"] or "").strip() for p in all_pending if p["message"]))
+                if deliver_to_ntfy(_topic, merged):
+                    for p in all_pending:
+                        storage.mark_pending_pushed(conn, p["pending_id"])
+                    storage.log_line(
+                        f"heartbeat ntfy: digest 合并推送 {len(all_pending)} 条 → 全部 pushed")
+                else:
+                    storage.log_line("heartbeat ntfy: digest 推送失败，pending 保留待重试")
+            elif deliver_to_ntfy(_topic, result["message"]):
+                storage.mark_pending_pushed(conn, pending_id)
+                storage.log_line(
+                    f"heartbeat ntfy: {pending_id} 已推送 → status=pushed"
+                )
     else:
         storage.log_line(
             f"heartbeat {result['decision']}: {result['reason']}"
@@ -420,7 +634,7 @@ def enable_model_adapter(router=None) -> dict:
 #
 # 现在每种原因一个状态，**配置错误不再伪装成节流**。
 TICK_THROTTLED = "throttled"                # 距上次检查太近，本次不跑
-TICK_PENDING_ACTION = "pending_action"      # 已有待处理项，先兑现、不重复生成
+TICK_PENDING_ACTION = "pending_action"      # 已有待处理项：检查照常执行并留痕（executed=True），但不生成新的主动意图
 TICK_EXECUTED = "executed"                  # 真的跑了一次 tick（内含 result）
 TICK_CONFIG_ERROR = "configuration_error"   # 配置有问题（心跳规则缺失等）
 TICK_RUNTIME_ERROR = "runtime_error"        # 其他运行时异常（含异常类型，可追踪）
@@ -429,7 +643,7 @@ TICK_STATUSES = (TICK_THROTTLED, TICK_PENDING_ACTION, TICK_EXECUTED,
 
 
 def maybe_tick(session, *, now: datetime | None = None,
-               trigger: str = TRIGGER_CHAT) -> dict:
+               trigger: str = TRIGGER_CHAT, dry_run: bool = False) -> dict:
     """**节流版触发**：满足间隔才真跑。
 
     此前这段策略写在 `chat.py` 里（`maybe_heartbeat_tick`）——
@@ -444,10 +658,21 @@ def maybe_tick(session, *, now: datetime | None = None,
     | status | 含义 | 额外字段 |
     |---|---|---|
     | `throttled` | 距上次检查不到 `MIN_GAP_MINUTES` | `gap_minutes` |
-    | `pending_action` | 已有待处理主动意图，先兑现 | `pending_count` |
+    | `pending_action` | 已有待处理主动意图：检查照常执行并留痕，但**不生成新的**（2026-11-07 HB-0 起，`executed=True`） | `pending_count`, `result` |
     | `executed` | 真的跑了一次 | `result`（tick 的完整返回） |
     | `configuration_error` | 心跳规则缺失/格式不可用 | `error` |
     | `runtime_error` | 其他异常 | `error`（含异常类型） |
+
+    ## 2026-11-07 修复（HB-0）：pending 不再短路整次心跳
+
+    **事故**：旧实现把「已有 pending」短路放在节流**之前**——只要存在 1 条未兑现
+    pending 就直接 return，**一条 heartbeat_runs 都不写**。后果：
+    pending 未兑现期间「上次检查时间」冻结（节流失真、监控全盲）；
+    schedule 触发启用后，会被一条卡住的 pending **永久挡死**。
+
+    **修法**：节流先行；pending 存在时照常 `tick` 并留痕，把「不重复生成」
+    下沉为 `tick(suppress_new_intent=True)` —— 决策降级为 wait
+    （action=pending_deferred），不再整体装死。回归测试：`selftest_companion.py` [P8.11c]。
 
     ## 兼容性
 
@@ -459,6 +684,20 @@ def maybe_tick(session, *, now: datetime | None = None,
 
     一切异常都被接住并转成 `runtime_error`，仍然不抛给聊天；
     但**不再静默** —— `status` 与 `error` 都带出去，并写一行日志。
+
+    ## `dry_run=True`：只算不写（2026-10-26 新增）
+
+    **为什么加**：`selftest.py` 的端到端自测会调 `chat.send_once()`，
+    而 `send_once` 会调本函数。结果是**跑一次状态生成就往真实库写进
+    `heartbeat_runs` / `pending_actions`** —— 污染了它本该测量的数据。
+
+    在此之前 `dry_run` 只存在于底层的 `tick()`，而 `maybe_tick` 没把它透传出来，
+    所以「经过节流的那条路径」**无法只算不写**。
+
+    现在透传：`dry_run=True` 时判定与节流照常走，但**不落盘、不提交**，
+    返回值的 `dry_run` 为 `True`、且不含 `result`。
+
+    **默认 `False`** —— 生产行为**一字未变**。
     """
     import storage
     trigger = trigger if trigger in TRIGGERS else TRIGGER_CHAT
@@ -476,13 +715,9 @@ def maybe_tick(session, *, now: datetime | None = None,
                 "error": msg}
 
     try:
-        # ② 已有待处理 → 先让它兑现，不重复生成
-        if storage.list_pending_actions(session.conn, status="pending"):
-            n = len(storage.list_pending_actions(session.conn, status="pending"))
-            return {"status": TICK_PENDING_ACTION, "executed": False,
-                    "trigger": trigger, "pending_count": n}
-
-        # ③ 距**上次心跳检查**太近 → 跳过
+        # ② 节流先行（2026-11-07，HB-0 换位）：距**上次心跳检查**太近 → 跳过。
+        #    「上次检查」只由 heartbeat_runs 定义，与有没有 pending 无关 ——
+        #    否则 pending 未兑现期间 last-run 冻结，节流与监控全部失真。
         last = session.conn.execute(
             "SELECT created_at_utc FROM heartbeat_runs ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
@@ -501,9 +736,22 @@ def maybe_tick(session, *, now: datetime | None = None,
         else:
             gap_min = None
 
-        result = tick(session.conn, session.settings, now=now, trigger=trigger)
-        session.conn.commit()
-        return {"status": TICK_EXECUTED, "executed": True, "trigger": trigger,
+        # ③ 已有待处理 → 检查**照常执行并留痕**，但压制新的主动意图。
+        #    （2026-11-07 修，HB-0）：旧实现把这条短路放在节流**之前**，只要存在
+        #    1 条未兑现 pending 就直接 return —— pending 期间一条 heartbeat_runs
+        #    都不写（上次检查时间冻结、监控全盲），schedule 触发上线后更会被一条
+        #    卡住的 pending **永久挡死**。「不重复生成」的语义保留，但下沉为
+        #    tick(suppress_new_intent=True)：决策降级为 wait 并留痕，不再整体装死。
+        #    （pending 的正常兑现出口：chat 注入→delivered（chat.py）、
+        #     ntfy 推送成功→pushed（tick 内 mark_pending_pushed）。）
+        pending_rows = storage.list_pending_actions(session.conn, status="pending")
+        result = tick(session.conn, session.settings, now=now, trigger=trigger,
+                      dry_run=dry_run, suppress_new_intent=bool(pending_rows))
+        if not dry_run:
+            session.conn.commit()
+        return {"status": TICK_PENDING_ACTION if pending_rows else TICK_EXECUTED,
+                "executed": True, "trigger": trigger, "dry_run": dry_run,
+                "pending_count": len(pending_rows),
                 "gap_minutes": None if gap_min is None else round(gap_min, 2),
                 "result": result}
 

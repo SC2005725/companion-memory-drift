@@ -82,10 +82,16 @@ def append_ledger(record: dict) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def read_ledger() -> list[dict]:
+def read_ledger_detailed() -> tuple[list[dict], int]:
+    """读账本，返回 (rows, corrupt_lines)。
+
+    F-4（费用可信度批 2026-11-14）：损坏行不再无声吞掉 —— 单独计数，
+    由 summarize() 带出，让「账本坏了导致费用汇总偏低」这件事可见。
+    """
     if not LEDGER_FILE.exists():
-        return []
+        return [], 0
     out = []
+    corrupt = 0
     for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -93,12 +99,17 @@ def read_ledger() -> list[dict]:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
-            continue
-    return out
+            corrupt += 1
+    return out, corrupt
+
+
+def read_ledger() -> list[dict]:
+    rows, _ = read_ledger_detailed()
+    return rows
 
 
 def summarize() -> dict:
-    rows = read_ledger()
+    rows, corrupt = read_ledger_detailed()
     total_micro = 0
     priced = 0
     unpriced = 0
@@ -113,6 +124,7 @@ def summarize() -> dict:
         "calls": len(rows),
         "priced_calls": priced,
         "unpriced_calls": unpriced,
+        "corrupt_lines": corrupt,
         "prompt_tokens": sum(int(r.get("prompt_tokens") or 0) for r in rows),
         "completion_tokens": sum(int(r.get("completion_tokens") or 0) for r in rows),
         "cache_hit_tokens": sum(int(r.get("cache_hit_tokens") or 0) for r in rows),
@@ -130,5 +142,8 @@ def format_summary(s: dict) -> str:
     ]
     if s["unpriced_calls"]:
         lines.append(f"未计价调用          : {s['unpriced_calls']} 次（该模型未登记在 settings.json 的 cost.models 中）")
+    if s.get("corrupt_lines"):
+        lines.append(f"⚠️ 账本损坏行       : {s['corrupt_lines']} 行（这些行不计入汇总，"
+                     f"费用估算偏低 —— 请人工检查 logs/ledger.jsonl）")
     lines.append("说明：费用为按官方公开单价的估算值，实际扣费以服务商账单为准。")
     return "\n".join(lines)

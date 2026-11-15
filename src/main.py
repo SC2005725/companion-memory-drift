@@ -106,7 +106,11 @@ def cmd_verify(args) -> int:
         # Phase 5：记忆版本与原始数据一样要能校验
         import memory as memory_mod
 
-        vreport = memory_mod.verify_versions()
+        # 雷 7（2026-11-07）：喂 DB 登记的 sha 做第三方见证比对 ——
+        # 文件与 sidecar 在竞态事故里会被一起覆盖，DB 账是独立见证。
+        _db_sha = {r["version"]: r["file_sha256"]
+                   for r in storage.list_memory_versions(conn)}
+        vreport = memory_mod.verify_versions(db_sha=_db_sha)
         print(
             f"记忆版本校验：{vreport['checked']} 个 → "
             f"{'通过' if vreport['ok'] else '失败'}"
@@ -610,10 +614,23 @@ def cmd_heartbeat(args) -> int:
     """
     import heartbeat as hb_mod
     import storage
-    from config import ConfigError, load_settings
+    from config import ConfigError, load_env, load_settings
 
     try:
         settings = load_settings()
+        # 2026-11-04：补 load_env()（此前只有 `cmd_chat` 调，这条命令没调）。
+        #
+        # 为什么必须补：`heartbeat.tick` 判定 proactive 后会给 ntfy 投递，而
+        # `ntfy_topic_from_env()` 是**直接读进程环境变量**（heartbeat.py:333）。
+        # 不调 load_env，把 `NTFY_TOPIC` 写进 `.env` 也只有「聊天时」那条路径生效，
+        # 心跳/计划任务这条路径永远读到空串 → 永远不投递。而「主动」的意义恰恰是
+        # 在**用户不聊天的时候**送达。
+        #
+        # 实测：不 load_env → `''`；load_env() 之后 → 配置里的值。
+        #
+        # 为什么安全：`load_env()` 只往进程环境里写，`.env` 缺失或无该键时是空操作
+        # （config.py:142-143）；判定逻辑一行未动，未配置 NTFY_TOPIC 时行为与旧版一致。
+        load_env()
     except (ConfigError, ValueError) as exc:
         print(f"[配置错误] {exc}")
         return 2

@@ -1,5 +1,9 @@
 # memory-drift-experiment · 项目报告
 
+> **历史快照（截止 2026-10-07）** —— 这是 `memory-drift-experiment_V0.1_Phase1-3_min` 的核对报告，
+> 反映的是 V0.1 · Phase 1–3 当时的情况，文中的缺陷与文档错配清单多数已处理。
+> 当前状态与最新数字见仓库根目录的 `STATUS.md`。
+
 | 项目 | 值 |
 |------|-----|
 | 报告对象 | `memory-drift-experiment_V0.1_Phase1-3_min` |

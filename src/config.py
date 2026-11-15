@@ -121,7 +121,7 @@ def load_env(*, fresh: bool = False) -> Env:
         _load_env_minimal(ENV_FILE, force=fresh)
 
     api_key = (os.environ.get("LLM_API_KEY") or "").strip()
-    base_url = (os.environ.get("LLM_BASE_URL") or "https://api.deepseek.com").strip()
+    base_url = (os.environ.get("LLM_BASE_URL") or DEFAULT_BASE_URL).strip()
     model = (os.environ.get("LLM_MODEL") or "").strip()
 
     peak_raw = (os.environ.get("LLM_PEAK") or "").strip()
@@ -165,6 +165,10 @@ def resolve_model(settings: Settings, env: Env) -> str:
 
 _ALLOWED_ENV_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "LLM_PEAK")
 
+# 唯一已知安全的默认端点。改动它等于把 Key 送去别的地址 —— 所以
+# `/api/env/test` 只在端点仍是这个值时，才允许使用**已保存的** Key。
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+
 
 def _validate_env_value(key: str, value: str) -> str:
     """返回空串 = 合法；非空 = 拒绝理由。
@@ -174,6 +178,12 @@ def _validate_env_value(key: str, value: str) -> str:
     不校验的话，值里带一个换行就能往 `.env` 里**注入任意新键**
     （例如把 `LLM_BASE_URL` 指到攻击者的服务器，密钥就发出去了）。
     所以：单行、有长度上限、键名限定在白名单内。
+
+    ## 2026-10-26 补：`LLM_BASE_URL` 还要过 URL 校验
+
+    上面堵住的是**注入**，但**合法写入**同样危险 —— 白名单里放着
+    `LLM_BASE_URL`，攻击者不需要注入，正大光明改它就行。
+    所以对这一个键额外要求：**https + 非本机/私网地址**。
     """
     if key not in _ALLOWED_ENV_KEYS:
         return f"不认识的配置项：{key}"
@@ -187,6 +197,39 @@ def _validate_env_value(key: str, value: str) -> str:
                       ("\x00", "空字符")):
         if bad in value:
             return f"值里不能含{name}"
+    if key == "LLM_BASE_URL":
+        reason = _validate_base_url(value)
+        if reason:
+            return reason
+    return ""
+
+
+def _validate_base_url(value: str) -> str:
+    """`LLM_BASE_URL` 的额外校验：返回空串 = 合法。
+
+    **只允许 https，且不指向本机/内网。**
+    理由：这个键决定了「Key 会被发到哪台服务器」。允许 http 就等于允许
+    明文外传；允许本机/内网地址就等于把它变成一个内网探测或本地代理跳板。
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    try:
+        parsed = _urlparse(value)
+    except ValueError:
+        return "不是合法的 URL"
+    if parsed.scheme != "https":
+        return "只允许 https（明文 http 会把密钥暴露在链路上）"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "URL 里没有主机名"
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return "不允许指向本机地址"
+    if host.endswith((".local", ".internal")):
+        return "不允许指向内网地址"
+    if (host.startswith("10.") or host.startswith("192.168.")
+            or host.startswith("169.254.") or host.startswith("172.")):
+        # 172.16–31 才是私网；这里宽松一点全挡，因为没人会拿 172.x 当模型端点
+        return "不允许指向内网地址"
     return ""
 
 

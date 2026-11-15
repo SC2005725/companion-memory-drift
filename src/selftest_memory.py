@@ -283,6 +283,139 @@ def main() -> int:
     print(f"  文件：{vfiles}")
     print(f"  v001 首条：{v1.items[0].text}")
 
+    # ===== [5.2] 雷7：跨进程锁 + 原子写 + DB sha 第三方见证 =====
+    # 旧版 "exists 检查 + write_text" 是 TOCTOU：并发同写会互相覆盖整份版本，
+    # sidecar 一起被覆盖 → verify 对错误内容照样报"通过"。
+    print("\n[5.2] 雷7 回归：版本落盘竞态 / 陈锁破锁 / 账实比对")
+    import hashlib as _hashlib
+    import os as _os
+    import threading as _th
+    import time as _time
+
+    def _mk_mv(version: str, text: str, tag: str) -> "memory_mod.MemoryVersion":
+        return memory_mod.MemoryVersion(
+            version=version, created_at="2026-11-07T22:00:00+08:00",
+            model="fake", source_range={}, note=f"lei7-{tag}",
+            items=[memory_mod.MemoryItem(id="m_" + version, type="FACT",
+                                         text=text, first_seen_version=version)])
+
+    # ① 双线程同写一个版本：恰好一个成功，落盘内容是赢家的、不被混杂覆盖
+    _results: list[str] = []
+
+    def _racer(tag: str, text: str) -> None:
+        try:
+            memory_mod.save_version(_mk_mv("v990", text, tag))
+            _results.append(tag)
+        except memory_mod.MemoryError:
+            pass
+
+    t_a, t_b = _th.Thread(target=_racer, args=("A", "甲写的记忆")), \
+        _th.Thread(target=_racer, args=("B", "乙写的记忆"))
+    t_a.start(); t_b.start(); t_a.join(); t_b.join()
+    check("并发同写恰好一个成功（无静默覆盖）", len(_results) == 1, str(_results))
+    _v990 = paths.VERSIONS_DIR / "v990.json"
+    _body990 = _v990.read_text(encoding="utf-8") if _v990.exists() else ""
+    _w = _results[0] if _results else "?"
+    check("落盘内容与赢家一致（append-only 未被击穿）",
+          ("甲写的记忆" in _body990) == (_w == "A")
+          and ("乙写的记忆" in _body990) == (_w == "B"), _w)
+
+    # ② 陈锁（>30s）视为持有者已崩溃 → 破锁接管，写入成功
+    _stale = paths.VERSIONS_DIR / ".v991.save.lock"
+    _stale.write_text("", encoding="utf-8")
+    _old = _time.time() - 60
+    _os.utime(_stale, (_old, _old))
+    try:
+        memory_mod.save_version(_mk_mv("v991", "陈锁破锁后写入", "stale"))
+        check("30s 陈锁被破、写入成功", (paths.VERSIONS_DIR / "v991.json").exists())
+    except memory_mod.MemoryError as e:
+        check("30s 陈锁被破、写入成功", False, str(e)[:80])
+
+    # ③ 活跃锁（别人正在写）→ 等待超时后拒绝，绝不强行覆盖
+    _active = paths.VERSIONS_DIR / ".v992.save.lock"
+    _active.write_text("", encoding="utf-8")
+    _bak_wait = memory_mod._LOCK_WAIT_SECONDS
+    memory_mod._LOCK_WAIT_SECONDS = 0.3
+    try:
+        try:
+            memory_mod.save_version(_mk_mv("v992", "不该被写进", "active"))
+            check("活跃锁阻塞写入（超时拒绝）", False, "竟然写进去了")
+        except memory_mod.MemoryError as e:
+            check("活跃锁阻塞写入（超时拒绝）", "锁等待超时" in str(e), str(e)[:60])
+    finally:
+        memory_mod._LOCK_WAIT_SECONDS = _bak_wait
+        _active.unlink(missing_ok=True)
+
+    # ④ 落盘无残留：tmp 半成品和锁文件都该清干净（半截文件不再可能出现）
+    _leftovers = [p.name for p in paths.VERSIONS_DIR.glob("*.tmp-*")] + \
+        [p.name for p in paths.VERSIONS_DIR.glob(".*.save.lock")]
+    check("落盘无 tmp/锁残留", _leftovers == [], str(_leftovers))
+
+    # ⑤ verify_versions 的 DB 第三方见证：文件+sidecar 一起被覆盖时，DB 账能揭穿
+    _sha990 = _hashlib.sha256(
+        _body990.rstrip("\n").encode("utf-8")).hexdigest()
+    _rep_ok = memory_mod.verify_versions(db_sha={"v990": _sha990})
+    check("DB sha 一致 → 校验通过", _rep_ok["ok"], str(_rep_ok["errors"][:1]))
+    _rep_bad = memory_mod.verify_versions(db_sha={"v990": "0" * 64})
+    check("文件被换内容 → DB 账揭穿",
+          not _rep_bad["ok"] and any("DB" in e for e in _rep_bad["errors"]),
+          str(_rep_bad["errors"][:1]))
+    _rep_ghost = memory_mod.verify_versions(db_sha={"v888": "0" * 64})
+    check("DB 有账、文件不在 → 账实不符",
+          not _rep_ghost["ok"] and any("v888" in e for e in _rep_ghost["errors"]),
+          str(_rep_ghost["errors"][:1]))
+
+    # 清场：v990/v991 是本块的脚手架。不删的话 load_latest() 会返回它们
+    # （字典序排在 v003 之后、且只有 1 条记忆），污染后面的检索测试。
+    for _p in ("v990.json", "v990.json.sha256",
+               "v991.json", "v991.json.sha256"):
+        (paths.VERSIONS_DIR / _p).unlink(missing_ok=True)
+
+    # ===== [5.4] P1 批回归：v1000 数值排序 + 半截版本文件回退（2026-11-08）=====
+    print("\n[5.4] P1 回归：v1000 数值排序 + 半截版本文件回退")
+    _v999f = paths.VERSIONS_DIR / "v999.json"
+    _v1000f = paths.VERSIONS_DIR / "v1000.json"
+    _halff = paths.VERSIONS_DIR / "v1001.json"
+    try:
+        import json as _json54
+        _good = {"version": "v1000", "created_at": "2026-11-08T00:00:00+00:00",
+                 "model": "selftest", "items": []}
+        _v999f.write_text(_json54.dumps(
+            {**_good, "version": "v999"}, ensure_ascii=False), encoding="utf-8")
+        _v1000f.write_text(_json54.dumps(_good, ensure_ascii=False),
+                           encoding="utf-8")
+        _halff.write_text('{"version": "v1001", "created_at', encoding="utf-8")  # 半截
+        _vers54 = memory_mod.existing_versions()
+        check("existing_versions 数值序（v999 < v1000 < v1001）",
+              _vers54[-3:] == ["v999", "v1000", "v1001"], str(_vers54[-3:]))
+        _lat54 = memory_mod.load_latest()
+        check("load_latest 拿到 v1000（不再被 v999 压住）",
+              _lat54 is not None and _lat54.version == "v1000",
+              _lat54.version if _lat54 else "None")
+        check("半截 v1001 被跳过、回退到 v1000（检索不挂）",
+              _lat54 is not None and _lat54.version != "v1001",
+              _lat54.version if _lat54 else "None")
+        # 显式指定读坏版本 = 有人在点名查证 → 必须大声报错，不许静默给旧版
+        try:
+            memory_mod.load_version("v1001")
+            check("显式 load_version 坏文件仍大声报错（不静默）", False,
+                  "v1001 居然读出来了")
+        except Exception:
+            check("显式 load_version 坏文件仍大声报错（不静默）", True, "")
+    finally:
+        for _p in ("v999.json", "v1000.json", "v1001.json",
+                   "v999.json.sha256", "v1000.json.sha256", "v1001.json.sha256"):
+            (paths.VERSIONS_DIR / _p).unlink(missing_ok=True)
+
+    # ===== [5.3] 雷8：conversations.db 三进程写护栏 =====
+    print("\n[5.3] 雷8 回归：WAL + busy_timeout（三进程写不再秒炸）")
+    _jm = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    check("journal_mode=wal（读写不互斥）", str(_jm).lower() == "wal", str(_jm))
+    _bt = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    check("busy_timeout=5000（锁被占先等不炸）", int(_bt) == 5000, str(_bt))
+    _syn = conn.execute("PRAGMA synchronous").fetchone()[0]
+    check("synchronous=NORMAL(1)（WAL 推荐档）", int(_syn) == 1, str(_syn))
+
     # ===== [5.5] 会话头打印（真实崩溃过的回归测试）=====
     #
     # 真实事故：`chat.run_repl()` 里内联的会话头用了 `mem.item_count`，
@@ -414,6 +547,40 @@ def main() -> int:
     print(f"  (d) 同义零词重叠   → {len(synonym)} 条（已知能力边界）")
     for it, s in scored:
         print(f"      score={s:.3f}  {it.text}")
+
+    # ===== ★ 2026-11-07（外部调研 #1）：三因子排序回归 =====
+    # 相关性相同（同文本）时：新近 + 被召回过的条目应排在陈旧 + 从未召回的前面。
+    print("\n[7.x] 三因子排序：同相关度下，时效×召回价值 决定先后")
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    _now = _dt.now(_tz.utc)
+    _iso_old = (_now - _td(days=120)).isoformat()
+    _iso_new = (_now - _td(hours=2)).isoformat()
+    mv_fac = memory_mod.MemoryVersion(
+        version="v_fac", created_at=_iso_new, model="selftest",
+        items=[
+            memory_mod.MemoryItem(id="fac_old", type="FACT", text="用户提过上夜班的经历",
+                                  source_event_ids=[], created_at=_iso_old,
+                                  updated_at=_iso_old, recall_count=0),
+            memory_mod.MemoryItem(id="fac_new", type="FACT", text="用户提过上夜班的经历",
+                                  source_event_ids=[], created_at=_iso_new,
+                                  updated_at=_iso_new, last_recalled_at=_iso_new,
+                                  recall_count=3),
+        ],
+        previous_version=None,
+    )
+    r_fac = memory_mod.retrieve(mv_fac, "上夜班", top_k=2, now=_now)
+    # P2（2026-11-15）：同文本近重复在检索清单里**折叠**——保留排序最优的一份。
+    # 重要性排序仍然决定「哪份幸存」（fac_new 时效新 + 被召回多 → 它留下），
+    # 但旧断言期望两份都出现已不成立（重复内容不再重复占名额）。
+    check("同文本不同时效：折叠后保留新近+被召回的那份（P2 语义）",
+          [x.id for x in r_fac] == ["fac_new"],
+          str([x.id for x in r_fac]))
+    scored_fac = memory_mod.retrieve_scored(mv_fac, "上夜班", top_k=2, now=_now)
+    # 口径一致性改为**首条一致**：scored 是预留路径（无折叠），retrieve 生产路径
+    # 有 P2 折叠——两者对「谁排第一」必须同判，尾部数量差异属有意行为。
+    check("retrieve_scored 与 retrieve 首条口径一致",
+          scored_fac and [x.id for x, _ in scored_fac][0] == r_fac[0].id,
+          str([(x.id, round(s, 3)) for x, s in scored_fac]))
 
     # ===== [8] 检索落盘（P0 机制）=====
     print("\n[8] 检索落盘（P0：每轮都要落，含 0 命中）")
@@ -648,6 +815,257 @@ def main() -> int:
         print("         所以必须先有真实数据。想跑它：")
         print("           先用真实对话跑几轮，触发一次自动整理生成 memory/versions/，")
         print("           再重新执行本文件。")
+
+    # ===== [5.7] 处方 A：经历提炼（情绪峰值检测 → EPISODE 候选，2026-11-08）=====
+    print("\n[5.7] 处方 A 回归：情绪峰值检测 + EPISODE 进核心记忆")
+    import companion_core as _core57
+    import episode_scan as _eps
+    # ⚠️ 事故教训（2026-11-08）：core_candidates 的 MEMORY_DIR 在 **import 时**
+    # 绑定 core.CORE_DIR（产线真实记忆链 core/memory-heci）。必须先重定向
+    # CORE_DIR 再首次 import core_candidates，否则整理员会把测试 EPISODE
+    # 写进产线版本链（本次实测发生过，v007 已删除止血）。
+    _core57.CORE_DIR = TEMP_ROOT / "core-dir-episode"
+    _core57.CORE_DB = TEMP_ROOT / "core-episode.db"
+    import core_candidates as _cc57   # 首次 import：绑定上面重定向的目录
+
+    def _t57(seq, local, u, a):
+        return {"seq": seq, "created_at_local": local,
+                "user_text": u, "assistant_text": a}
+
+    # -- 纯函数：检测与聚合 --
+    _turns57 = [
+        _t57(1, "2026-11-07T14:00:00+08:00", "今天天气不错", "是啊"),
+        _t57(2, "2026-11-07T23:40:00+08:00", "今晚终于把这个 bug 修好了，开心！", "太好了，恭喜！"),
+        _t57(3, "2026-11-07T23:55:00+08:00", "谢谢你陪我弄到这么晚", "该说谢谢的是我，陪你熬夜我也很开心。"),
+        _t57(4, "2026-11-08T10:00:00+08:00", "中午吃什么", "随便呀"),
+    ]
+    _eps57 = _eps.detect_episodes(_turns57)
+    check("深夜+情绪词+共同完成 → 检出 1 段经历", len(_eps57) == 1, str(len(_eps57)))
+    check("相邻信号轮聚成一个窗口（seq 2-3，无信号轮不入窗）",
+          bool(_eps57) and _eps57[0]["seq_start"] == 2 and _eps57[0]["seq_end"] == 3
+          and _eps57[0]["turns"] == 2, str(_eps57[:1]))
+    check("EPISODE 条目带原话节选+深夜标注+信号标注",
+          bool(_eps57) and "修好了" in _eps57[0]["item"]["text"]
+          and "深夜" in _eps57[0]["item"]["text"]
+          and "信号：" in _eps57[0]["item"]["text"],
+          _eps57[0]["item"]["text"][:60] if _eps57 else "")
+    check("类型/分层/分类齐备（EPISODE/experience/共同经历）",
+          bool(_eps57) and _eps57[0]["item"]["type"] == "EPISODE"
+          and _eps57[0]["item"]["tier"] == "experience"
+          and _eps57[0]["item"]["category"] == "共同经历", "")
+    check("原话节选限长（≤80 字含省略号）",
+          bool(_eps57) and len(_eps57[0]["item"]["text"]) <= 160,
+          str(len(_eps57[0]["item"]["text"])) if _eps57 else "-")
+    check("完全无信号 → 零提案",
+          _eps.detect_episodes([_t57(9, "2026-11-08T10:00:00+08:00",
+                                     "吃饭了吗", "吃了")]) == [], "")
+
+    # -- E2E：提案 → 整理员接纳进版本 --
+    _conn57 = _core57.connect()
+    _core57.init_schema(_conn57)
+    _core57.ensure_subject(_conn57)
+    _now57 = _core57._now()
+    _conn57.execute(
+        "INSERT INTO instances (instance_id, subject_id, environment, "
+        "started_at, last_seen_at, capabilities) VALUES ('heci_001','heci_001','',?,?,?)",
+        (_now57, _now57, "[]"))
+    _conn57.commit()
+    # 游标预置到"当前最大 seq"：套件早段的夹具轮次不进本节的扫描窗，
+    # 本节只对自己新插入的 3 轮负责（seq 接在其后，避免跨会话 seq 撞号）。
+    _top57 = conn.execute("SELECT MAX(seq) m FROM conversations").fetchone()["m"] or 0
+    _conn57.execute(
+        "INSERT INTO episode_scan_state (id, last_seq, updated_at) VALUES (1, ?, ?)",
+        (_top57, _core57._now()))
+    _conn57.commit()
+    _sid57 = "epscan-selftest"
+    _seed57 = [("今晚终于把这个 bug 修好了，开心！", "太好了，恭喜！"),
+               ("谢谢你陪我弄到这么晚", "该说谢谢的是我，陪你熬夜我也很开心。"),
+               ("中午吃什么", "随便呀")]
+    for _i, (_u, _a) in enumerate(_seed57, start=_top57 + 1):
+        storage.save_turn(conn, session_id=_sid57, seq=_i,
+                          user_text=_u, assistant_text=_a, model="selftest",
+                          persona_name="鹤辞", persona_sha256="epscan")
+    # 时间戳拨针（save_turn 用当下时间，测试要可控的本地小时）：
+    # 头两轮 = 23:40 深夜（该检出），第三轮 = 白天 10 点（不该检出）。
+    # 否则凌晨跑自测时，第三轮会被「深夜」信号如实命中——检测器没错，是钟点。
+    conn.execute("UPDATE conversations SET created_at_local='2026-11-07T23:40:00+08:00' "
+                 "WHERE session_id=? AND seq <= ?", (_sid57, _top57 + 2))
+    conn.execute("UPDATE conversations SET created_at_local='2026-11-08T10:00:00+08:00' "
+                 "WHERE session_id=? AND seq = ?", (_sid57, _top57 + 3))
+    conn.commit()
+
+    _st57 = _eps.run_episode_scan(core_conn=_conn57, storage_conn=conn)
+    check("首扫提案 1 条 EPISODE 候选", len(_st57["proposed"]) == 1, str(_st57))
+    check("游标推进到本节最新 seq", _st57["cursor"] == _top57 + 3,
+          str(_st57["cursor"]))
+    _again57 = _eps.run_episode_scan(core_conn=_conn57, storage_conn=conn)
+    check("重扫幂等（无新轮 → 零提案零检出）",
+          _again57["proposed"] == [] and _again57["detected"] == 0, str(_again57))
+
+    _out57 = _cc57.run()
+    check("整理员接纳 EPISODE 候选", _out57["stats"]["accepted"] >= 1,
+          str(_out57["stats"]))
+    # core_candidates 写的是 core 链（core_candidates.MEMORY_DIR，已随 CORE_DIR
+    # 重定向到临时目录），不是 memory_mod 的 paths.VERSIONS_DIR——各读各的链。
+    import json as _json57
+    _core_vs57 = sorted(_cc57.MEMORY_DIR.glob("v*.json"),
+                        key=lambda p: int(p.stem[1:]))
+    _lat57 = (json.loads(_core_vs57[-1].read_text(encoding="utf-8"))
+              if _core_vs57 else {"items": []})
+    _ep_items57 = [it for it in (_lat57.get("items") or [])
+                   if str(it.get("type")) == "EPISODE"]
+    check("core 链新版本里 EPISODE 类型存活（不被降级 UNKNOWN）",
+          len(_ep_items57) >= 1,
+          str([(it.get("type"), str(it.get("text"))[:30])
+               for it in (_lat57.get("items") or [])][:3]))
+    from memory import MemoryItem as _MI57
+    _mi57 = _MI57.from_dict(_ep_items57[0]) if _ep_items57 else None
+    check("EPISODE 来源=亲历（remembered）",
+          _mi57 is not None and _mi57.provenance == "remembered",
+          _mi57.provenance if _mi57 else "-")
+    check("测试全程不污染真实 core 链（临时目录里才有新版本）",
+          _cc57.MEMORY_DIR.is_relative_to(TEMP_ROOT),
+          str(_cc57.MEMORY_DIR))
+    _conn57.close()
+
+    # ===== [5.8] 链桥：core 链 → 主链 同步（处方 A 收口，2026-11-08）=====
+    # 缺口：聊天检索只读主链，core 链（整理员/EPISODE/muse 提案）从未被桥接
+    # ——记忆在账上、不在脑子里。桥 = core 快照里主链没有的条目按相似度去重
+    # 后追加成一个主链新版本，幂等。
+    print("\n[5.8] 链桥回归：core 链同步进主链（幂等/去重/EPISODE 存活）")
+    import chain_sync as _csy
+    _pre58 = memory_mod.load_latest()
+    _pre_top58 = _pre58.version if _pre58 else None
+    _sync1 = _csy.sync_core_to_main()
+    check("首同步把 core 链条目带进主链", _sync1["added"] >= 1 and _sync1["version"],
+          str(_sync1))
+    _mv58 = memory_mod.load_latest()
+    check("主链新版本 = 原最新 +1（快照式追加）",
+          _mv58 is not None and _pre_top58 is not None
+          and int(_mv58.version[1:]) == int(_pre_top58[1:]) + 1,
+          f"{_pre_top58} -> {_mv58.version if _mv58 else None}")
+    _types58 = {it.type for it in (_mv58.items if _mv58 else [])}
+    check("主链新版本含 EPISODE（她的检索终于看得见经历）",
+          "EPISODE" in _types58, str(_types58))
+    check("sidecar 落了 + verify 全绿（账实一致）",
+          (paths.VERSIONS_DIR / f"{_mv58.version}.sha256").exists()
+          and memory_mod.verify_versions()["ok"],
+          str(memory_mod.verify_versions()["errors"][:2]))
+    _sync2 = _csy.sync_core_to_main()
+    check("重同步幂等（零新增、零新版本）",
+          _sync2["added"] == 0 and _sync2["version"] is None, str(_sync2))
+
+    # ===== [5.9] 记忆优化批 M-2/M-3（2026-11-14）：预算联动 + recency tie-break =====
+    print("\n[5.9] 记忆优化批回归：注入预算随条数联动 / 同分新条目靠前")
+    _mk = lambda i, t, created=None: memory_mod.MemoryItem(
+        id=i, type="FACT", text=t, created_at=created)
+    # M-2：预算 = max(700, 160×条数)。20 条长条目（>80 字）不全被压成碎片
+    _items20 = [_mk(f"m{i:02d}", "用户喜欢在周末的清晨去逛离家不远的花市挑一些新鲜的茉莉和桔梗。" * 2)
+                for i in range(20)]
+    _rendered = memory_mod.render_for_prompt(_items20)
+    _short_cnt = sum(1 for line in _rendered.splitlines()
+                     if line.startswith("- [") and line.rstrip().endswith("…")
+                     and len(line) < 120)
+    check("top_k=20 时预算联动，被压成短摘要的条目 < 20（旧版会几乎全压碎）",
+          _short_cnt < 10, f"碎片数={_short_cnt}")
+    _r5 = memory_mod.render_for_prompt(_items20[:5])
+    check("显式传 budget_chars 仍以调用方为准",
+          "极短" not in _r5 and len(_r5) > 0, f"len={len(_r5)}")
+    _r1 = memory_mod.render_for_prompt([_mk("m1", "短条目")])
+    check("单条目预算不低于旧版 700（回调 top_k 不浪费）",
+          "短条目" in _r1, "")
+    # M-3：同分时新条目靠前（recency tie-break）
+    _old = _mk("old", "用户喜欢茉莉。", created="2026-10-01T10:00:00+08:00")
+    _new = _mk("new", "用户喜欢茉莉与桔梗。", created="2026-11-14T10:00:00+08:00")
+    _mv_tie = memory_mod.MemoryVersion(version="v999tie", created_at="2026-11-14",
+                                       model="fake", items=[_old, _new])
+    _picked = memory_mod.retrieve(_mv_tie, "用户喜欢什么花", top_k=1)
+    check("同分 tie-break：新条目排前（不再被旧条目占位）",
+          len(_picked) == 1 and _picked[0].id == "new",
+          f"picked={[i.id for i in _picked]}")
+    _picked_all = memory_mod.retrieve(_mv_tie, "用户喜欢什么花", top_k=2)
+    check("同分两条都召回时新条目在前",
+          [i.id for i in _picked_all][:1] == ["new"],
+          f"order={[i.id for i in _picked_all]}")
+    _no_time = _mk("notime", "用户喜欢茉莉。")
+    # 纯 tie-break 断言：created_at 完全相同（importance 也相同）→ id 兜底，
+    # 顺序完全确定（id DESC），不依赖 dict/DB 顺序
+    _a = _mk("aaa", "用户喜欢茉莉。", created="2026-11-14T09:00:00+08:00")
+    _z = _mk("zzz", "用户喜欢茉莉。", created="2026-11-14T09:00:00+08:00")
+    _mv_same = memory_mod.MemoryVersion(version="v999same", created_at="2026-11-14",
+                                        model="fake", items=[_a, _z])
+    _picked_same = memory_mod.retrieve(_mv_same, "用户喜欢什么花", top_k=2)
+    # P2：完全同文本 → 折叠只留一份；id DESC 兜底决定哪份幸存，完全确定可复现
+    check("完全同分同时间：折叠保留 id DESC 的那份（完全确定，可复现）",
+          [i.id for i in _picked_same] == ["zzz"],
+          f"order={[i.id for i in _picked_same]}")
+    # 未知时间条目 vs 旧时间条目：未知时间不衰减（≥ 旧条目），不因无时间被垫底
+    _old10 = _mk("old10", "用户喜欢茉莉。", created="2026-10-01T10:00:00+08:00")
+    _mv_nt = memory_mod.MemoryVersion(version="v999nt", created_at="2026-11-14",
+                                      model="fake", items=[_new, _no_time])
+    _picked_nt = memory_mod.retrieve(_mv_nt, "用户喜欢什么花", top_k=2)
+    check("无时间戳条目不衰减、不因无时间被垫底（未知时间 ≥ 明确旧时间）",
+          [i.id for i in _picked_nt][0] == "notime",
+          f"order={[i.id for i in _picked_nt]}")
+
+    # ===== [5.10] 记忆优化批 M-4/M-5（2026-11-15）：偏好兜底 + 查询时间窗 =====
+    print("\n[5.10] 记忆优化批 M-4/M-5：偏好兜底 + 查询时间窗")
+    _pref = memory_mod.MemoryItem(id="pref1", type="FACT",
+                                  text="用户不太能接受苦味，偏好拿铁。",
+                                  category="偏好", created_at="2026-11-10T09:00:00+08:00")
+    _mv_pref = memory_mod.MemoryVersion(version="v999p", created_at="2026-11-14",
+                                        model="fake", items=[_pref])
+    _q_taste = "我的喜好是什么样的"
+    _got0 = memory_mod.retrieve(_mv_pref, _q_taste, top_k=3)
+    check("M-4 病灶复现：偏好查询常规打分 0 命中（词面错开且无同义覆盖）",
+          len(_got0) == 0, f"{[i.id for i in _got0]}")
+    _got1 = memory_mod.retrieve(_mv_pref, "我的口味是什么样的 你推荐一下", top_k=3)
+    check("M-4 偏好查询兜底补位（口味/推荐词触发，偏好条目补入）",
+          len(_got1) == 1 and _got1[0].id == "pref1", f"{[i.id for i in _got1]}")
+    # M-4 加权直测：同 1.0 强命中之下，偏好条目被 +0.6 顶到前面
+    _norm2 = memory_mod.MemoryItem(id="norm2", type="FACT",
+                                   text="用户喝咖啡比较多。", category="个人事实",
+                                   created_at="2026-11-10T09:00:00+08:00")
+    _mv_boost = memory_mod.MemoryVersion(version="v999b", created_at="2026-11-14",
+                                         model="fake", items=[_norm2, _pref])
+    _gotb = memory_mod.retrieve(_mv_boost, "爱喝什么", top_k=3)
+    check("M-4 偏好加权：同强命中下偏好条目 +0.6 顶前（查询侧门控开+同义扩词）",
+          len(_gotb) == 2 and _gotb[0].id == "pref1", f"{[i.id for i in _gotb]}")
+    _plain = memory_mod.MemoryItem(id="plain", type="FACT",
+                                   text="用户让我推荐几本讲口味的书。",
+                                   category="个人事实", created_at="2026-11-10T09:00:00+08:00")
+    _mv_two = memory_mod.MemoryVersion(version="v999p2", created_at="2026-11-14",
+                                       model="fake", items=[_pref, _plain])
+    _got2 = memory_mod.retrieve(_mv_two, "你推荐一下口味的书", top_k=3)
+    check("M-4 兜底不覆盖常规命中（常规条目在前、偏好条目补位在后）",
+          len(_got2) == 2 and [i.id for i in _got2][0] == "plain"
+          and "pref1" in [i.id for i in _got2], f"{[i.id for i in _got2]}")
+    _nonpref_q = memory_mod.retrieve(_mv_pref, "天气怎么样", top_k=3)
+    check("M-4 非偏好查询不兜底（乱补偏好条目是噪声）",
+          len(_nonpref_q) == 0, f"{[i.id for i in _nonpref_q]}")
+
+    # M-5：时间窗——同词面分，窗内条目压过窗外条目
+    _recent = memory_mod.MemoryItem(id="recent", type="FACT",
+                                    text="用户去了花市买茉莉。",
+                                    created_at="2026-11-12T10:00:00+08:00")
+    _ancient = memory_mod.MemoryItem(id="ancient", type="FACT",
+                                     text="用户去了花市买桔梗。",
+                                     created_at="2026-08-01T10:00:00+08:00")
+    _mv_t5 = memory_mod.MemoryVersion(version="v999t5", created_at="2026-11-14",
+                                      model="fake", items=[_ancient, _recent])
+    _got5 = memory_mod.retrieve(_mv_t5, "最近有没有去花市", top_k=2)
+    check("M-5 时间窗：最近条目压过窗外条目（同词面分 + 窗内加权）",
+          len(_got5) == 2 and _got5[0].id == "recent", f"{[i.id for i in _got5]}")
+    _got_nt5 = memory_mod.retrieve(_mv_t5, "花市", top_k=2)
+    check("M-5 无时间词查询不受影响（recency tie-break 仍新在前）",
+          len(_got_nt5) == 2 and _got_nt5[0].id == "recent", f"{[i.id for i in _got_nt5]}")
+    _mv_none_t = memory_mod.MemoryVersion(version="v999t6", created_at="2026-11-14",
+                                          model="fake",
+                                          items=[memory_mod.MemoryItem(
+                                              id="nt", type="FACT", text="用户去了花市买茉莉。")])
+    _got_nt2 = memory_mod.retrieve(_mv_none_t, "最近有没有去花市", top_k=2)
+    check("M-5 无时间戳条目不被窗调整（不伪造时间，仍正常召回）",
+          len(_got_nt2) == 1 and _got_nt2[0].id == "nt", f"{[i.id for i in _got_nt2]}")
 
     # --- 汇总 ---
     conn.close()

@@ -13,7 +13,18 @@ from dataclasses import dataclass, field
 
 
 class LLMError(RuntimeError):
-    pass
+    """LLM 调用失败。
+
+    F-1（费用可信度批 2026-11-14）：失败前已真实发生的用量挂在 `usage` 上
+    （已发出的 HTTP attempt 数在 `attempts`），由统一出口 call_model 兜底入账
+    —— **失败的调用也可能真实扣费**（典型：思考吃满预算→重试仍空→抛错，
+    这两次请求服务端都已计费），不能因为抛异常就漏记。
+    """
+
+    def __init__(self, message: str, *, usage: "Usage | None" = None, attempts: int = 0):
+        super().__init__(message)
+        self.usage = usage
+        self.attempts = attempts
 
 
 @dataclass
@@ -93,6 +104,52 @@ def _as_dict(obj) -> dict:
     return {}
 
 
+def _usage_from_resp(resp) -> Usage:
+    """从一次响应里取用量（F-1：每个 attempt 都要取，不再只看最后一次）。"""
+    usage_obj = getattr(resp, "usage", None)
+    return Usage(
+        prompt_tokens=int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+        completion_tokens=int(getattr(usage_obj, "completion_tokens", 0) or 0),
+        cache_hit_tokens=_extract_cache_hit(usage_obj),
+        raw=_as_dict(usage_obj),
+    )
+
+
+def _reasoning_tokens_of(raw: dict) -> int:
+    """取 raw 里的思考 token 数（口径与 chat._extract_reasoning_tokens 一致）。"""
+    details = raw.get("completion_tokens_details") if isinstance(raw, dict) else None
+    if isinstance(details, dict):
+        v = details.get("reasoning_tokens")
+        if isinstance(v, int):
+            return v
+    v = raw.get("reasoning_tokens") if isinstance(raw, dict) else None
+    return v if isinstance(v, int) else 0
+
+
+def _merge_usage(first: Usage, last: Usage) -> Usage:
+    """合并多次 attempt 的用量（F-1）：token 相加，费用不再漏掉第一次请求。
+
+    raw 保留末次原文 + 首次存档在 `first_attempt_usage`，审计时可还原逐次明细。
+    思考 token（藏在 raw.completion_tokens_details.reasoning_tokens）单独相加，
+    相加后仍是单一数值，chat._extract_reasoning_tokens 的记账口径不破。
+    """
+    raw = dict(last.raw or {})
+    if first.raw:
+        raw["first_attempt_usage"] = dict(first.raw)
+    r_first = _reasoning_tokens_of(first.raw or {})
+    r_last = _reasoning_tokens_of(last.raw or {})
+    if r_first or r_last:
+        details = dict(raw.get("completion_tokens_details") or {})
+        details["reasoning_tokens"] = r_first + r_last
+        raw["completion_tokens_details"] = details
+    return Usage(
+        prompt_tokens=first.prompt_tokens + last.prompt_tokens,
+        completion_tokens=first.completion_tokens + last.completion_tokens,
+        cache_hit_tokens=first.cache_hit_tokens + last.cache_hit_tokens,
+        raw=raw,
+    )
+
+
 def _extract_text(message) -> str:
     content = getattr(message, "content", None)
     if isinstance(content, str):
@@ -146,17 +203,52 @@ class LLMClient:
         self.empty_retries = 0
 
     def _raw_send(self, messages: list[dict], max_tokens: int, model: str | None = None):
-        try:
-            return self._client.chat.completions.create(
-                # 每次请求可以覆盖模型（Phase 10 Model Router 需要）。
-                # 不传就用构造时定的默认模型 —— 老调用方行为完全不变。
-                model=model or self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=max_tokens,
-            )
-        except Exception as exc:
-            raise LLMError(_friendly_error(exc)) from exc
+        # 2026-11-04：429 自动退避。检测到限速不再直接作废这一轮，
+        # 而是记下「限速到几点」→ 等 → 重试；rate_guard 的定时器会在
+        # 到点自动解除闸门（不发探测请求，恢复由下一次真实调用验证）。
+        import time
+
+        import rate_guard
+
+        g = rate_guard.guard()
+        attempt = 0
+        while True:
+            # 上一次被限速、闸门还没开 → 先等，别白撞一次
+            g.wait_if_limited()
+            try:
+                resp = self._client.chat.completions.create(
+                    # 每次请求可以覆盖模型（Phase 10 Model Router 需要）。
+                    # 不传就用构造时定的默认模型 —— 老调用方行为完全不变。
+                    model=model or self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=max_tokens,
+                )
+                g.note_success()
+                return resp
+            except Exception as exc:
+                if rate_guard.looks_like_429(exc) and attempt < g.max_retries:
+                    attempt += 1
+                    delay = g.note_limit(str(exc), rate_guard.retry_after_of(exc))
+                    try:
+                        import storage
+
+                        storage.log_line(
+                            f"rate limit 429：第 {attempt} 次命中，退避 {delay:.0f}s 后重试")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # 写进主体事件账本 —— 这样限速不只在本进程可见，
+                    # 另一个实例（Muse）也能拉到「这边正在被限速」。
+                    try:
+                        import core_capture
+
+                        core_capture.record_rate_limit(
+                            attempt=attempt, delay=delay, reason=str(exc))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(delay)
+                    continue
+                raise LLMError(_friendly_error(exc)) from exc
 
     def send(self, messages: list[dict], model: str | None = None) -> Reply:
         """发一次请求，并在「被截断且无内容」时自动重试。
@@ -179,32 +271,48 @@ class LLMClient:
         便于事后统计这种现象有多频繁。
         """
         started = time.perf_counter()
-        resp = self._raw_send(messages, self.max_tokens, model)
-        attempts = 1
+        # F-1（费用可信度批 2026-11-14）：用量按 attempt 累计。
+        # 旧实现只读最后一次的 usage —— 第一次请求（已真实计费）被无声丢掉；
+        # 重试抛错时更是两次全丢。现在每次 attempt 都取用量并合并，
+        # 失败路径把累计用量挂在 LLMError 上，由 call_model 兜底入账。
+        usage_total = Usage()
+        attempts = 0
         retried = False
+
+        try:
+            resp = self._raw_send(messages, self.max_tokens, model)
+        except LLMError as exc:
+            exc.usage = exc.usage or usage_total
+            exc.attempts = exc.attempts or attempts + 1
+            raise
+        attempts += 1
+        usage_total = _merge_usage(usage_total, _usage_from_resp(resp))
 
         if not _has_content(resp):
             reason = _finish_reason(resp)
             if reason == "length" and self.empty_retry_max_tokens > self.max_tokens:
                 # 预算被思考吃光 —— 加大预算重试
-                resp = self._raw_send(messages, self.empty_retry_max_tokens, model)
-                attempts = 2
+                try:
+                    resp2 = self._raw_send(messages, self.empty_retry_max_tokens, model)
+                except LLMError as exc:
+                    exc.usage = exc.usage or usage_total
+                    exc.attempts = exc.attempts or attempts
+                    raise
+                resp = resp2
+                attempts += 1
                 retried = True
                 self.empty_retries += 1
+                usage_total = _merge_usage(usage_total, _usage_from_resp(resp))
 
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         if not getattr(resp, "choices", None):
-            raise LLMError("模型没有返回任何回复（choices 为空）。")
+            raise LLMError(
+                "模型没有返回任何回复（choices 为空）。",
+                usage=usage_total, attempts=attempts)
 
         text = _extract_text(resp.choices[0].message)
-        usage_obj = getattr(resp, "usage", None)
-        usage = Usage(
-            prompt_tokens=int(getattr(usage_obj, "prompt_tokens", 0) or 0),
-            completion_tokens=int(getattr(usage_obj, "completion_tokens", 0) or 0),
-            cache_hit_tokens=_extract_cache_hit(usage_obj),
-            raw=_as_dict(usage_obj),
-        )
+        usage = usage_total
         if not text.strip():
             # 重试后仍然为空 —— 不静默当作正常回复，明确报错让调用方决定怎么处理。
             raise LLMError(
@@ -213,7 +321,8 @@ class LLMClient:
                 f"completion_tokens={usage.completion_tokens}，"
                 f"重试={'是' if retried else '否'}）。"
                 "推理模型的思考 token 会占用 max_tokens 预算，"
-                "可调大 config/settings.json 的 max_tokens。"
+                "可调大 config/settings.json 的 max_tokens。",
+                usage=usage, attempts=attempts,
             )
         return Reply(
             text=text,

@@ -1,24 +1,98 @@
-"""离线自测（不调用任何 API，不花钱）。
+"""Phase 1-3 离线自测（不调用任何 API，不花钱，**不污染任何真实数据**）。
 
 用一个假的 LLM 客户端喂固定的回复，把 Phase 1-3 的整条链路真跑一遍：
     人格拼装 → 组装 messages → 记账 → 原始对话落盘 → 事件判定 → 原始事件落盘 → 校验
 
-为什么需要它：真实 API 调用要花钱、要联网、结果还随机；而链路上大部分环节
-（存储、哈希链、事件固化、计价）跟模型无关，必须先确认这部分是对的。
+## 2026-11-15 重写：**全量隔离**（取代"真实库+补偿清理"旧设计）
+
+旧设计（真实库上跑 + `--clean` 只删自造行）有三个已实锤的失败模式：
+    1. **真实库污染**：补偿清单漏一张表就静默失效——用户模型孤儿快照事故
+       （引用不存在的 seq）、heartbeat_runs/pending_actions 污染（hence dry_run 补丁）。
+    2. **守卫路径过期**：`_REAL_PROJECT_ROOT` 写死 D 盘旧路径，项目迁到
+       AutoClaw 目录后守卫形同虚设——2026-11-15 独立体检实锤：
+       **16 条假对话进了生产哈希链（seq 361/371-374）、22 条假账进了 api_calls**，
+       且假对话经整理员进了记忆链（v016+ 夜班条目）。删除会断链，只能保留。
+    3. **--clean 在哈希链时代失效**：删行 = 断链，旧补偿逻辑已不可用。
+
+新设计（与 selftest_llm_exit 同款）：**一切写入重定向到临时目录**，断言与
+链路覆盖完全不变，跑完整目录删除。`--clean` / `--allow-real` 两个旗标
+保留但成为无害 no-op（status_snapshot.py 仍在用它们调用）。
 
 用法：
-    python src\\selftest.py          跑自测（会在 conversation/ 留下测试数据）
-    python src\\selftest.py --clean  跑完自测后清掉测试数据
+    python src\\selftest.py          跑自测（临时目录，跑完即删，零污染）
+    python src\\selftest.py --clean  兼容旧调用（现为 no-op）
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+# ⚠️ 隔离库里没有存档锚点（first_archive.json 记录的是真实主链的 seq）——
+# archive_anchor.py:143 的既有约定：隔离测试方设 DSH_SKIP_ANCHOR=1，锚点不参与判定。
+# （archive_anchor 的 ROOT 从自身文件位置推导，immune to paths 重定向——必须用这个开关。）
+os.environ["DSH_SKIP_ANCHOR"] = "1"   # 强制置位：隔离库上锚点校验必然失真
+
+SRC = Path(__file__).resolve().parent
+PROJECT = SRC.parent
+sys.path.insert(0, str(SRC))
+
+# --- 全量隔离：先建临时目录、重定向 paths，再导入业务模块 ---------------------
+# （业务模块在 import 时绑定 paths 的值——顺序错了隔离就失效。）
+TEMP_ROOT = Path(tempfile.mkdtemp(prefix="selftest_p13_"))
+
+import paths  # noqa: E402
+
+paths.ROOT = TEMP_ROOT
+paths.CONFIG_DIR = TEMP_ROOT / "config"
+paths.PROMPTS_DIR = paths.CONFIG_DIR / "prompts"
+paths.SETTINGS_FILE = paths.CONFIG_DIR / "settings.json"
+paths.PERSONALITY_FILE = TEMP_ROOT / "personality" / "personality.json"
+paths.CONVERSATION_DIR = TEMP_ROOT / "conversation"
+paths.DB_FILE = paths.CONVERSATION_DIR / "conversations.db"
+paths.MEMORY_DIR = TEMP_ROOT / "memory"
+paths.RAW_DIR = paths.MEMORY_DIR / "raw"
+paths.RAW_EVENTS_DIR = paths.RAW_DIR / "events"
+paths.VERSIONS_DIR = paths.MEMORY_DIR / "versions"
+paths.CHANGELOG_DIR = paths.MEMORY_DIR / "changelog"
+paths.RECALL_DIR = TEMP_ROOT / "recall"
+paths.RELATIONSHIP_DIR = TEMP_ROOT / "relationship"
+paths.USER_MODEL_DIR = TEMP_ROOT / "user_model"
+paths.EXPERIMENTS_DIR = TEMP_ROOT / "experiments"
+paths.LOGS_DIR = TEMP_ROOT / "logs"
+paths.LEDGER_FILE = paths.LOGS_DIR / "ledger.jsonl"
+paths.RUN_LOG_FILE = paths.LOGS_DIR / "run.log"
+paths.CONSOLIDATE_PROMPT_FILE = paths.PROMPTS_DIR / "consolidate.md"
+paths.ARCHIVE_ANCHOR_FILE = paths.EXPERIMENTS_DIR / "first_archive.json"
+
+paths.ensure_dirs()
+
+# 拷贝真实配置：人格/设置/提示词——断言要测「真实人格渲染」「真实计价」。
+# ⚠️ 不拷存档锚点（first_archive.json 记录 seq=144，隔离库只有 4 轮，
+# 锚点校验在全新库上本就不适用——拷了反而 verify 失败）。
+for _src_name, _dst in (
+    ("config/settings.json", paths.SETTINGS_FILE),
+    ("config/prompts/consolidate.md", paths.CONSOLIDATE_PROMPT_FILE),
+    ("personality/personality.json", paths.PERSONALITY_FILE),
+):
+    _src = PROJECT / _src_name
+    if _src.exists():
+        shutil.copy2(_src, _dst)
+
+# 旧路径绑定的业务模块全部重载（selftest_llm_exit 同款做法）
+for _m in ("storage", "pricing", "memory", "changelog", "retrieve", "consolidate",
+           "chat", "verify", "config", "persona", "probe", "relationship",
+           "user_model", "events", "llm", "model_router", "archive_anchor",
+           "heartbeat"):
+    sys.modules.pop(_m, None)
 
 import chat  # noqa: E402
 import events as events_mod  # noqa: E402
@@ -27,7 +101,6 @@ import storage  # noqa: E402
 import verify  # noqa: E402
 from config import load_settings  # noqa: E402
 from llm import Reply, Usage  # noqa: E402
-from paths import USER_MODEL_DIR  # noqa: E402
 from persona import load_persona  # noqa: E402
 
 # 固定的假对话：第 1 句故意命中事件触发词，用来验证原始事件固化
@@ -59,107 +132,32 @@ class FakeClient:
         )
 
 
-# 已知的**正式项目目录**。只有跑在这里才需要守卫。
-#
-# ## 为什么不能靠 `paths.ROOT == Path(__file__).parent.parent`
-# 那个判据在**任何副本里也成立**（副本自带 paths.py），
-# 于是会连副本一起拒 —— 而 `dryrun.py` 正是在副本里调本自测的，
-# 那样会把演练一起弄坏。
-#
-# ## 为什么写成字面路径是可以接受的
-# 它只是**保护**用的默认值，不是运行必需 —— 换机器时守卫会失效（退化为不保护），
-# 但不会妨碍运行。要临时在别处跑，加 `--allow-real` 或设环境变量即可。
-_REAL_PROJECT_ROOT = Path(r"（本地路径）")
-
-
-def _is_real_project_root() -> bool:
-    """当前跑的是不是**正式项目目录**（而不是隔离副本）。
-
-    ## 为什么加这道守卫
-    本自测会 `storage.connect()` 连**真实库**并调 `send_once`，
-    靠「只删自造行」的补偿机制收尾。实测踩到的坑：
-    用户模型（Phase 7 才有）**不在那个补偿清单里**，
-    于是留下了一份引用**不存在的 seq** 的孤儿快照，污染了正式数据。
-
-    补偿机制只要漏一张表就静默失效 —— 所以加一道**显式**守卫：
-    默认拒绝在正式目录上写。逃生门复用项目既有的
-    `DSH_ALLOW_REAL_DB_WRITE`，免得出现两套约定。
-    """
-    try:
-        from paths import ROOT
-        here = os.path.abspath(str(ROOT))
-    except Exception:
-        return False
-    return here == os.path.abspath(str(_REAL_PROJECT_ROOT))
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Phase 1-3 离线自测")
-    parser.add_argument("--clean", action="store_true", help="自测后删除测试数据")
-    parser.add_argument("--allow-real", action="store_true",
-                        help="显式允许在正式项目目录上跑（会写真实库；默认拒绝）")
+    parser = argparse.ArgumentParser(description="Phase 1-3 离线自测（全量隔离版）")
+    # 兼容旧调用：status_snapshot.py 用 --clean --allow-real 调本自测。
+    # 全量隔离后两者皆 no-op——保留旗标以免外部调用方报错。
+    parser.add_argument("--clean", action="store_true", help="（兼容旧调用，现为 no-op）")
+    parser.add_argument("--allow-real", action="store_true", help="（兼容旧调用，现为 no-op）")
     args = parser.parse_args(argv)
-
-    if _is_real_project_root() and not (
-        args.allow_real or os.environ.get("DSH_ALLOW_REAL_DB_WRITE")
-    ):
-        print("拒绝在正式项目目录上运行自测。")
-        print("  本自测会写真实库；请任选一种方式：")
-        print("    ① 复制项目到临时目录后再跑（推荐）")
-        print("    ② 加 --allow-real 显式承担后果")
-        print("    ③ 设环境变量 DSH_ALLOW_REAL_DB_WRITE=1")
-        return 2
+    if args.clean or args.allow_real:
+        print("（--clean/--allow-real 已是 no-op：本自测全量隔离，不碰任何真实数据）")
 
     settings = load_settings()
     persona = load_persona()
     conn = storage.connect()
     client = FakeClient()
 
-    # --- 关键：先记下自测开始前已存在的事件 ID ---
-    #
-    # 自测会往 events 表写一条测试事件。--clean 必须只删**这次自测新建的**那一条，
-    # 绝不能按「表里所有事件」去删 —— 那会把真实实验数据一起删掉。
-    #
-    # 这里踩过一次真实的坑：早期版本按「删除时刻表里的全部事件」清理，
-    # 结果把实验基准事件 raw_event_001 删了（它是 ground truth，属于真实实验数据）。
-    preexisting_event_ids = {
-        r["event_id"] for r in conn.execute("SELECT event_id FROM events").fetchall()
-    }
-    if preexisting_event_ids:
-        print(
-            f"注意：events 表里已有 {len(preexisting_event_ids)} 条既有事件，"
-            "它们不会被本次 --clean 触碰。"
-        )
-
-    # 记下跑之前 user_model/ 里已有哪些快照文件。
-    # 快照是**文件**（不是数据库行），--clean 必须能区分「本次新建的」与「真实历史的」。
-    # 只算快照本体（.json），不要把 .sha256 sidecar 也数进来 —— 否则数字翻倍
-    preexisting_um_files = {q.name for q in USER_MODEL_DIR.glob("model_v*.json")}
-    if preexisting_um_files:
-        print(f"注意：user_model/ 里已有 {len(preexisting_um_files)} 份快照，本次 --clean 不会触碰它们。")
-
-    # 同理记下已存在的会话 ID。--clean 靠它区分「自己的测试行」和「真实数据行」。
-    preexisting_session_ids = {
-        r["session_id"]
-        for r in conn.execute("SELECT DISTINCT session_id FROM conversations").fetchall()
-        if r["session_id"]
-    } | {
-        r["session_id"]
-        for r in conn.execute("SELECT DISTINCT session_id FROM api_calls").fetchall()
-        if r["session_id"]
-    } | {
-        r["session_id"]
-        for r in conn.execute("SELECT DISTINCT session_id FROM events").fetchall()
-        if r["session_id"]
-    }
+    # 自测在**临时库**上从零开始——既有集合恒为空，保留变量以少动断言
+    preexisting_event_ids: set = set()
 
     session = chat.new_session(
         persona=persona, settings=settings, client=client, peak_override=False, conn=conn
     )
 
     print("=" * 64)
-    print("Phase 1-3 离线自测（不调用真实 API）")
+    print("Phase 1-3 离线自测（不调用真实 API；全量隔离，零污染）")
     print("=" * 64)
+    print(f"隔离目录：{TEMP_ROOT}")
 
     # --- 人格拼装 ---
     system_prompt = persona.render_system_prompt()
@@ -195,17 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     checks.append(("命中触发词的句子已固化为事件", s["events"] >= 1, str(s["events"])))
 
     # --- 事件文件 ---
-    #
-    # 先算出「本次自测新建了哪些事件」，后续的展示、校验、清理都只针对这些。
-    # 这样即便 events 表里已有真实实验数据（如基准事件 raw_event_001），
-    # 自测的项数与报告也不会被它们影响，更不会去动它们。
     created_event_ids = [
         r["event_id"]
         for r in conn.execute("SELECT event_id FROM events").fetchall()
-        if r["event_id"] not in preexisting_event_ids
     ]
 
-    print("\n[4] 原始事件文件（仅本次自测新建的）")
+    print("\n[4] 原始事件文件（临时目录内）")
     if not created_event_ids:
         print("  （本次没有新建事件 —— 这不符合预期）")
     for event_id in created_event_ids:
@@ -226,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     checks.append(("校验通过", report["ok"], f"{report['turns_checked']} 轮 / {report['events_checked']} 事件"))
 
     # --- 篡改检测 ---
-    print("\n[6] 篡改检测（自测完会回滚）")
+    print("\n[6] 篡改检测（改完会回滚）")
     first = conn.execute("SELECT * FROM conversations ORDER BY seq ASC LIMIT 1").fetchone()
     original = first["user_text"]
     conn.execute("UPDATE conversations SET user_text=? WHERE turn_id=?", ("我改成别的了。", first["turn_id"]))
@@ -271,186 +264,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  [{'通过' if good else '失败'}] {name}" + (f"  ({detail})" if detail else ""))
     print("=" * 64)
     print(f"共 {len(checks)} 项，通过 {len(checks) - len(failed)} 项，失败 {len(failed)} 项。")
-    print("说明：本次自测使用的是假客户端，没有产生任何真实 API 费用。")
+    print("说明：本次自测使用的是假客户端，没有产生任何真实 API 费用；全程零污染。")
 
-    # 注意：连接必须在 _clean 之后才关闭 —— _clean 需要 DELETE 本次自测写入的行。
-    # 早期版本在这里先 close() 再 _clean()，导致清理静默失败（sqlite3.ProgrammingError），
-    # 测试数据残留、留下孤儿事件行。
-    if args.clean:
-        removed = _clean(conn, created_event_ids, preexisting_session_ids, session.session_id,
-                     preexisting_um_files)
-        print(
-            f"\n已清理测试数据：{removed['events']} 个事件文件、"
-            f"{removed['turns']} 轮对话、{removed['api_calls']} 条调用记录、"
-            f"{removed['ledger']} 条费用流水、"
-            f"{len(removed.get('um_snapshots') or [])} 份用户模型快照。"
-        )
-        if removed["protected_skipped"]:
-            print(f"已保护、未删除的基准事件：{'、'.join(removed['protected_skipped'])}")
-        if removed["kept_sessions"]:
-            print(f"已保留的既有会话：{'、'.join(removed['kept_sessions'])}")
-        print("（数据库文件本身、既有真实数据、memory/versions/ 均未被触碰）")
-
+    # --- 清理：整个临时目录（隔离设计的收尾——不再需要任何补偿式删除）---
     conn.close()
+    shutil.rmtree(TEMP_ROOT, ignore_errors=True)
+    print(f"已清理隔离目录：{TEMP_ROOT}")
+
     return 1 if failed else 0
-
-
-def _clean(conn, event_ids: list[str], keep_session_ids: set, test_session_id: str,
-           preexisting_um_files: set | None = None) -> dict:
-    """只删除**本次自测新建**的测试数据。绝不删除数据库文件本身。
-
-    ## 三道保护，每一条都是踩过坑之后加的
-
-    1. **不删 `conversation/` 目录**。早期版本用 `shutil.rmtree(CONVERSATION_DIR)`，
-       结果把整个 `conversations.db` 删了 —— 连带删掉真实实验数据行，
-       并且留下「文件还在、数据库没记录」的孤儿事件文件。
-       现在改为只 DELETE 属于本次自测会话的行，数据库文件始终保留。
-
-    2. **不按 `glob("*")` 通配删事件文件**，只按 ID 精确删。
-
-    3. **硬保护基准事件 ID**（`raw_event_001`）。它是实验 ground truth，
-       属于真实实验数据，不是测试产物。
-
-    `keep_session_ids` 是自测开跑前就存在的会话 ID 集合；`test_session_id` 是本次自测的。
-    只有二者不重叠时才会删行；重叠时宁可少删也不误删真实数据。
-    """
-    from paths import LEDGER_FILE, RAW_EVENTS_DIR
-
-    PROTECTED_EVENT_IDS = {"raw_event_001"}
-
-    # --- 1) 事件文件：按 ID 精确删，跳过受保护的 ---
-    removed_events = 0
-    skipped_protected = []
-    reverted_event_ids = []
-    for event_id in event_ids:
-        if not event_id or "/" in event_id or "\\" in event_id:
-            continue  # 事件 ID 来自数据库，仍然挡一道，避免目录穿越
-        if event_id in PROTECTED_EVENT_IDS:
-            skipped_protected.append(event_id)
-            continue
-        reverted_event_ids.append(event_id)
-        for name in (f"{event_id}.json", f"{event_id}.sha256"):
-            path = RAW_EVENTS_DIR / name
-            if path.is_file():
-                path.unlink()
-                removed_events += 1
-
-    # --- 2) 数据库行：只删本次自测会话的，且该会话不属于既有会话 ---
-    turns = 0
-    calls = 0
-    kept_sessions = sorted(keep_session_ids)
-    if test_session_id and test_session_id not in keep_session_ids:
-        cur = conn.execute("DELETE FROM conversations WHERE session_id = ?", (test_session_id,))
-        turns = cur.rowcount or 0
-        cur = conn.execute("DELETE FROM api_calls WHERE session_id = ?", (test_session_id,))
-        calls = cur.rowcount or 0
-        conn.execute("DELETE FROM retrievals WHERE session_id = ?", (test_session_id,))
-        # events 行也必须删，否则会留下「数据库有记录但文件已删」的缺失状态
-        placeholders = ",".join("?" for _ in reverted_event_ids)
-        if reverted_event_ids:
-            conn.execute(
-                f"DELETE FROM events WHERE event_id IN ({placeholders})", reverted_event_ids
-            )
-
-        # 顺带清理孤儿检索记录。
-        #
-        # 为什么需要：`retrievals` 是 Phase 5 才加的表。在它加入之前跑过的自测，
-        # 只删了 conversations / api_calls，于是留下「会话已不存在、检索记录还在」的孤儿。
-        # 这里把「既不在 conversations、也不在 api_calls、也不是既有会话」的检索记录
-        # 一并清掉 —— 加 keep_session_ids 白名单，宁可少删也不碰真实数据。
-        orphan_ids = [
-            r["session_id"]
-            for r in conn.execute("SELECT DISTINCT session_id FROM retrievals").fetchall()
-            if r["session_id"]
-            and r["session_id"] not in keep_session_ids
-            and not conn.execute(
-                "SELECT 1 FROM conversations WHERE session_id = ? LIMIT 1", (r["session_id"],)
-            ).fetchone()
-            and not conn.execute(
-                "SELECT 1 FROM api_calls WHERE session_id = ? LIMIT 1", (r["session_id"],)
-            ).fetchone()
-        ]
-        for sid in orphan_ids:
-            conn.execute("DELETE FROM retrievals WHERE session_id = ?", (sid,))
-        if orphan_ids:
-            kept_sessions = kept_sessions + [f"(顺带清理孤儿检索: {len(orphan_ids)} 个会话)"]
-
-        # ---- 顺带清理**用户模型**（Phase 7 才有的东西，原清理清单漏了它）----
-        #
-        # ## 实测踩到的坑（这是我造成的真实污染）
-        #
-        # 本自测跑在**真实库**上。加宽用户模型的捕获规则之后，
-        # SCRIPT 里那句「我以前在晚上工作过一年多…」开始命中信号，
-        # 于是 `send_once` 顺手写了一份用户模型快照 + 一条 user_model_events。
-        # 而 `--clean` 只删 conversations / api_calls / retrievals / events ——
-        # **用户模型原封不动**，于是正式数据里留下一条
-        # 引用 **seq=145**（而 conversations 最大只到 144）的孤儿条目。
-        #
-        # 清理原则与上面几条一致：**只删属于本次自测会话的**。
-        cur = conn.execute(
-            "DELETE FROM user_model_events WHERE session_id = ?", (test_session_id,)
-        )
-        um_events = cur.rowcount or 0
-        if um_events:
-            kept_sessions = kept_sessions + [f"(顺带清理用户模型事件: {um_events} 行)"]
-        conn.commit()
-
-    # ---- 用户模型**快照文件**：只删本次自测新建的那几份 ----
-    #
-    # 快照是 `chat.send_once` 直接落到 `user_model/` 目录的**文件**，
-    # 不属于数据库，所以上面的 DELETE 管不到它。
-    # 实测：只删数据库行的话，会留下一份引用不存在 seq 的孤儿快照。
-    #
-    # 清理原则与别处一致：**先记下跑之前有哪些文件，只删多出来的**。
-    # 绝不按 glob 全删 —— 那会把真实历史快照（v001–v007 是实验证据）清掉。
-    removed_snaps = []
-    try:
-        # 快照本体与其 .sha256 sidecar 一起清，别留下「摘要没了原文还在」的半截状态
-        for p in sorted(USER_MODEL_DIR.glob("model_v*.json")):
-            if p.name in (preexisting_um_files or set()):
-                continue
-            p.unlink(missing_ok=True)
-            removed_snaps.append(p.name)
-            side = p.with_suffix(".sha256")
-            if side.exists():
-                side.unlink(missing_ok=True)
-                removed_snaps.append(side.name)
-    except OSError:
-        pass
-
-    # --- 3) 费用流水：只摘掉本次自测那几行，不整文件删除 ---
-    removed_ledger = 0
-    if LEDGER_FILE.exists():
-        import json as _json
-
-        rows = []
-        for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = _json.loads(line)
-            except _json.JSONDecodeError:
-                rows.append(line)
-                continue
-            if rec.get("session_id") == test_session_id and test_session_id not in keep_session_ids:
-                removed_ledger += 1
-                continue
-            rows.append(line)
-        if rows:
-            LEDGER_FILE.write_text("\n".join(rows) + "\n", encoding="utf-8")
-        else:
-            LEDGER_FILE.unlink()
-
-    return {
-        "events": removed_events,
-        "turns": turns,
-        "api_calls": calls,
-        "ledger": removed_ledger,
-        "protected_skipped": skipped_protected,
-        "kept_sessions": kept_sessions,
-        "um_snapshots": removed_snaps,
-    }
 
 
 if __name__ == "__main__":

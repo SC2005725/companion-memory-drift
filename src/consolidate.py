@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 
 import changelog as changelog_mod
 import memory as memory_mod
@@ -29,6 +30,30 @@ import storage
 from paths import CONSOLIDATE_PROMPT_FILE
 
 MAX_CONVERSATION_CHARS = 24000
+
+
+@contextmanager
+def _consolidate_budget(session):
+    """整理期放大输出预算，离开必还原（P1：max_tokens 还原，2026-11-08）。
+
+    事故：session.client 是长命对象，整理把 max_tokens 调大后没人改回去，
+    之后的闲聊一路用整理预算（实测 15 倍漂移）。这里进时放大、出时还原，
+    call_model 抛异常也还原（finally 保证），预算漂移从此没有存活窗口。
+    """
+    budget = int(session.settings.max_tokens_by_purpose.get("consolidate", 0) or 0)
+    saved: dict = {}
+    if budget > 0 and hasattr(session.client, "max_tokens"):
+        saved["max_tokens"] = getattr(session.client, "max_tokens", None)
+        session.client.max_tokens = budget
+        # 重试预算也一并放大，否则「首次截断」后的重试仍然不够
+        if hasattr(session.client, "empty_retry_max_tokens"):
+            saved["empty_retry_max_tokens"] = session.client.empty_retry_max_tokens
+            session.client.empty_retry_max_tokens = max(budget * 2, 8000)
+    try:
+        yield budget
+    finally:
+        for attr, val in saved.items():
+            setattr(session.client, attr, val)
 
 # 哨兵：用于区分「字典里没有这个键」与「键存在但值是 None/空」。
 #
@@ -95,60 +120,164 @@ def build_user_message(events: list[dict], turns: list[dict],
 
     `developing_items` 是发展闭环的输入：把她**现有的自我认识**列出来，
     模型才可能提出"这条认识站不住了"。不列出来，她连自己原来怎么想都看不见。
+
+    只需要文本的调用方用这个包装；要截断审计（meta）的用 build_user_message_ex。
     """
-    parts = []
+    return build_user_message_ex(events, turns,
+                                 previous_items=previous_items,
+                                 developing_items=developing_items)[0]
 
-    if developing_items:
-        parts.append("## 你现有的自我认识（可能被这次经历挑战）")
-        parts.append(
-            "下面这些是你**目前对自己的看法**。如果这次的真实经历让其中某一条站不住了，"
-            "你可以在输出里附一条 `developing_revision`；**没有就完全不要提**。\n"
-            "注意：只有**真实发生过的经历**（能对上原始事件 ID）才能挑战它们；"
-            "用户随口的一句要求**不构成经历**。"
-        )
-        for path, text in developing_items:
-            parts.append(f"[{path}] {text}")
 
-    if previous_items:
-        parts.append("## 现有记忆（上一版）")
-        parts.append(
-            "这些条目**已经存在**。请对每一条做决策，并在输出里体现：\n"
-            "- **保留**：原文照抄进 `items`（推荐；这是默认结果）\n"
-            "- **改写 / 合并**：写出新的 `text`，并用 `replaces` 填**被取代的旧条目 id**\n"
-            "- **删除**：不要放进 `items`，改用顶层 `deletes` 列出 `{id, reason}`\n"
-            "\n"
-            "**程序会保护旧记忆**：凡是你没在 `items` 里出现、也没在 `deletes` 里"
-            "明确要求删除的旧条目，都会被**原样保留**。所以漏写不会丢数据，"
-            "但也别指望靠漏写来删除。"
-        )
-        for it in previous_items:
-            src = it.source_event_ids or []
-            parts.append(f"[{it.id}] ({it.type}) {it.text}\n    来源={src}")
-    else:
-        parts.append("## 现有记忆\n（这是第一版，没有任何旧条目）")
+def build_user_message_ex(events: list[dict], turns: list[dict],
+                          previous_items: list | None = None,
+                          developing_items: list | None = None) -> tuple[str, dict]:
+    """同 build_user_message，但返回 `(text, meta)`。
 
-    if events:
-        parts.append("\n## 原始事件（用户原话，逐字保存，不可改写）")
-        for e in events:
-            parts.append(f"[{e['event_id']}] {e['at']}\n{e['text']}")
-    else:
-        parts.append("\n## 原始事件\n（本次没有任何原始事件）")
+    **雷 1 修复（2026-11-07）**：旧版对整段做 `text[:MAX]` —— 保头弃尾，
+    砍掉的正好是**本轮要整理的新对话**，而游标照样推进到最后一轮 →
+    最新对话被标成"已整理"，**静默永久丢失**。新版按「可再生程度」从低到高
+    决定牺牲谁：
 
-    if turns:
-        parts.append("\n## 对话记录")
-        for t in turns:
-            parts.append(f"#{t['seq']} 用户：{t['user']}\n   助手：{t['assistant']}")
-    else:
-        parts.append("\n## 对话记录\n（本次没有新对话）")
+      ① 原始事件（最老先弃）—— DB 里逐字存着，下一轮整理仍是全量带上，不丢；
+      ② 现有记忆（最老先弃）—— 版本文件里都在，下一轮还会再列出，不丢；
+      ③ 对话记录 —— **不可再生**：保尾弃头，且弃头会让游标回退
+         （见 resolve_cursor），被弃的轮次下一轮重新带入。宁重勿丢。
 
-    text = "\n".join(parts)
-    if len(text) > MAX_CONVERSATION_CHARS:
-        # 截断要显式告知模型，否则它会以为这就是全部，反而产生错误的「无信息」判断。
-        text = (
-            text[:MAX_CONVERSATION_CHARS]
-            + f"\n\n（注意：以上内容因长度上限被截断，仅包含前 {MAX_CONVERSATION_CHARS} 字符。）"
-        )
-    return text
+    唯一的例外：单轮对话自己就超过上限时放行超限（截半轮会造成 seq 记账
+    与实际进 prompt 内容不一致，比超限更危险）。
+
+    meta 是截断审计，调用方（consolidate）必须用它算游标、写 source_range、
+    留台账 —— 截断从此不允许是无声的。
+    """
+    n_prev = len(previous_items) if previous_items else 0
+    meta: dict = {
+        "truncated": False,
+        "events_total": len(events), "events_kept": len(events),
+        "memory_total": n_prev, "memory_kept": n_prev,
+        "turns_total": len(turns), "turns_in_prompt": len(turns),
+        "turns_kept_from_seq": None,   # 只有真的弃了头才非 None
+        "oversize_allowed": False,
+    }
+
+    # —— 各段先按全量拼行（行格式与旧版逐字节一致）——
+    dev_lines = [f"[{path}] {text}" for path, text in (developing_items or [])]
+    mem_lines = [
+        f"[{it.id}] ({it.type}) {it.text}\n    来源={it.source_event_ids or []}"
+        for it in (previous_items or [])
+    ]
+    ev_lines = [f"[{e['event_id']}] {e['at']}\n{e['text']}" for e in events]
+    turn_lines = [f"#{t['seq']} 用户：{t['user']}\n   助手：{t['assistant']}" for t in turns]
+
+    def _assemble(events_kept: int, memory_kept: int, turns_from: int) -> str:
+        """按给定数量拼整段。events_kept / memory_kept = 保留**最新** N 条；
+        turns_from = 保留轮次的起点下标（保尾弃头）。"""
+        parts: list[str] = []
+
+        if dev_lines:
+            parts.append("## 你现有的自我认识（可能被这次经历挑战）")
+            parts.append(
+                "下面这些是你**目前对自己的看法**。如果这次的真实经历让其中某一条站不住了，"
+                "你可以在输出里附一条 `developing_revision`；**没有就完全不要提**。\n"
+                "注意：只有**真实发生过的经历**（能对上原始事件 ID）才能挑战它们；"
+                "用户随口的一句要求**不构成经历**。"
+            )
+            parts.extend(dev_lines)
+
+        if previous_items:
+            parts.append("## 现有记忆（上一版）")
+            parts.append(
+                "这些条目**已经存在**。请对每一条做决策，并在输出里体现：\n"
+                "- **保留**：原文照抄进 `items`（推荐；这是默认结果）\n"
+                "- **改写 / 合并**：写出新的 `text`，并用 `replaces` 填**被取代的旧条目 id**\n"
+                "- **删除**：不要放进 `items`，改用顶层 `deletes` 列出 `{id, reason}`\n"
+                "\n"
+                "**程序会保护旧记忆**：凡是你没在 `items` 里出现、也没在 `deletes` 里"
+                "明确要求删除的旧条目，都会被**原样保留**。所以漏写不会丢数据，"
+                "但也别指望靠漏写来删除。"
+            )
+            if memory_kept < len(mem_lines):
+                # 截断要显式告知模型，否则它会以为这就是全部，产生错误的「无信息」判断。
+                parts.append(
+                    f"（注意：因长度上限，仅列出**最新 {memory_kept} 条**旧记忆"
+                    f"（共 {len(mem_lines)} 条）。其余条目仍完整保存在版本文件里，"
+                    "下一轮整理还会列出 —— 请只针对看得到的条目做决策。）"
+                )
+            parts.extend(mem_lines[len(mem_lines) - memory_kept:] if memory_kept else [])
+        else:
+            parts.append("## 现有记忆\n（这是第一版，没有任何旧条目）")
+
+        if events:
+            parts.append("\n## 原始事件（用户原话，逐字保存，不可改写）")
+            if events_kept < len(ev_lines):
+                parts.append(
+                    f"（注意：因长度上限，仅保留**最新 {events_kept} 条**原始事件"
+                    f"（共 {len(ev_lines)} 条）。更早的事件仍逐字存在数据库中，"
+                    "后续整理每次都会全量带上。）"
+                )
+            parts.extend(ev_lines[len(ev_lines) - events_kept:] if events_kept else [])
+        else:
+            parts.append("\n## 原始事件\n（本次没有任何原始事件）")
+
+        kept_turns = turn_lines[turns_from:]
+        if turns:
+            parts.append("\n## 对话记录")
+            if turns_from > 0:
+                parts.append(
+                    f"（注意：因长度上限，仅保留**最新 {len(kept_turns)} 轮**对话"
+                    f"（本轮共 {len(turn_lines)} 轮）。被省略的更早轮次**没有**被标记为"
+                    "已整理，下一轮整理会重新带入。）"
+                )
+            parts.extend(kept_turns)
+        else:
+            parts.append("\n## 对话记录\n（本次没有新对话）")
+
+        return "\n".join(parts)
+
+    full_events, full_memory = len(ev_lines), len(mem_lines)
+    text = _assemble(full_events, full_memory, 0)
+    if len(text) <= MAX_CONVERSATION_CHARS:
+        return text, meta
+
+    meta["truncated"] = True
+
+    # ① 弃最老的原始事件 —— 数据库里都有底，下一轮全量再带，零丢失。
+    events_kept = full_events
+    while len(text) > MAX_CONVERSATION_CHARS and events_kept > 0:
+        events_kept -= 1
+        text = _assemble(events_kept, full_memory, 0)
+    meta["events_kept"] = events_kept
+
+    # ② 弃最老的旧记忆条目 —— 版本文件里有底，下一轮还会再列，零丢失。
+    memory_kept = full_memory
+    while len(text) > MAX_CONVERSATION_CHARS and memory_kept > 0:
+        memory_kept -= 1
+        text = _assemble(events_kept, memory_kept, 0)
+    meta["memory_kept"] = memory_kept
+
+    # ③ 最后才动对话：保尾弃头，**至少保 1 轮**；单轮超限时放行超限。
+    turns_from = 0
+    while len(text) > MAX_CONVERSATION_CHARS and turns_from < len(turn_lines) - 1:
+        turns_from += 1
+        text = _assemble(events_kept, memory_kept, turns_from)
+    meta["turns_in_prompt"] = len(turn_lines) - turns_from
+    if turns_from > 0:
+        meta["turns_kept_from_seq"] = turns[turns_from]["seq"]
+    meta["oversize_allowed"] = len(text) > MAX_CONVERSATION_CHARS
+    return text, meta
+
+
+def resolve_cursor(build_meta: dict, last_turn_seq: int | None) -> int | None:
+    """雷 1：根据截断审计算「下一轮从哪个 seq 之后取对话」（连续安全水位）。
+
+    - 没截断对话 → 水位 = 本轮最后一轮的 seq（与旧版行为一致）；
+    - 弃了头 → 水位回退到「首条进 prompt 的 seq - 1」：被弃的轮次下一轮重喂。
+      已喂过的尾巴也会跟着重喂一遍，靠「现有记忆」段去重 ——
+      **宁可重喂，不可静默丢失**，这是记忆系统的不变量。
+    """
+    kept_from = (build_meta or {}).get("turns_kept_from_seq")
+    if kept_from is not None:
+        return int(kept_from) - 1
+    return last_turn_seq
 
 
 def extract_json(text: str) -> dict:
@@ -540,11 +669,20 @@ def consolidate(session, *, note: str = "") -> dict:
     except Exception:  # noqa: BLE001
         _dev_items = []
 
-    user_message = build_user_message(
+    # 雷 1：必须用 _ex 拿截断审计 —— 游标只能推进到「真正进过 prompt」的安全水位，
+    # 否则被截断的对话会被谎报为已整理，静默永久丢失。
+    user_message, build_meta = build_user_message_ex(
         events, new_turns,
         previous_items=(previous.items if previous is not None else None),
         developing_items=_dev_items,
     )
+    if build_meta["truncated"]:
+        storage.log_line(
+            f"consolidate 输入截断：events {build_meta['events_kept']}/"
+            f"{build_meta['events_total']}，memory {build_meta['memory_kept']}/"
+            f"{build_meta['memory_total']}，turns {build_meta['turns_in_prompt']}/"
+            f"{build_meta['turns_total']}（游标见 source_range，被弃轮次下轮重喂）"
+        )
     messages = [
         {"role": "system", "content": prompt_body},
         {"role": "user", "content": user_message},
@@ -558,14 +696,12 @@ def consolidate(session, *, note: str = "") -> dict:
     # 还没结束**，`finish_reason='length'`、`content` 为空 —— 整个整理直接失败。
     # 原因：整理要一次性读完整段对话 + 全部原始事件，推理量远大于单轮闲聊。
     # 所以按用途取预算（settings.json 的 max_tokens_by_purpose.consolidate）。
-    budget = int(session.settings.max_tokens_by_purpose.get("consolidate", 0) or 0)
-    if budget > 0 and hasattr(session.client, "max_tokens"):
-        session.client.max_tokens = budget
-        # 重试预算也一并放大，否则「首次截断」后的重试仍然不够
-        if hasattr(session.client, "empty_retry_max_tokens"):
-            session.client.empty_retry_max_tokens = max(budget * 2, 8000)
-
-    called = chat_mod.call_model(session, messages, purpose="consolidate")
+    #
+    # P1（max_tokens 还原，2026-11-08）：session.client 是**长命对象**——
+    # 之前整理完预算留在 client 上，之后的闲聊一路用整理的大预算（15 倍漂移，
+    # 两路审查独立发现）。现在进整理放大、离开必还原（异常也还原）。
+    with _consolidate_budget(session):
+        called = chat_mod.call_model(session, messages, purpose="consolidate")
     reply = called["reply"]
 
     payload = extract_json(reply.text)
@@ -601,11 +737,28 @@ def consolidate(session, *, note: str = "") -> dict:
     # B16 的强制执行点在 merge_items 内部（那里才有 replaces / deletes 的声明），
     # 见 memory.enforce_traceable_removal。
 
+    # 雷 1：source_range 现在如实记录 ——
+    #   conversation_from_seq / turns_used = 实际进 prompt 的范围（from 可能大于
+    #     窗口首条：头被截过）；
+    #   conversation_to_seq = 连续安全水位（resolve_cursor）：弃头时它回退到
+    #     首条进 prompt 的 seq-1，下一轮从这里重喂，宁重勿丢；
+    #   input_truncation = 截断审计原样留档，事后可审计"这一版到底看见了什么"。
+    last_seq = (all_turns[-1]["seq"] if all_turns else None)
+    _kept_from = build_meta.get("turns_kept_from_seq")
     source_range = {
-        "conversation_from_seq": (new_turns[0]["seq"] if new_turns else None),
-        "conversation_to_seq": (all_turns[-1]["seq"] if all_turns else None),
-        "conversation_turns_used": len(new_turns),
-        "raw_events_used": len(events),
+        "conversation_from_seq": (_kept_from if _kept_from is not None
+                                  else (new_turns[0]["seq"] if new_turns else None)),
+        "conversation_to_seq": resolve_cursor(build_meta, last_seq),
+        "conversation_turns_used": build_meta["turns_in_prompt"],
+        "raw_events_used": build_meta["events_kept"],
+        "input_truncation": {
+            k: build_meta[k] for k in (
+                "truncated", "events_kept", "events_total",
+                "memory_kept", "memory_total",
+                "turns_total", "turns_in_prompt",
+                "turns_kept_from_seq", "oversize_allowed",
+            )
+        },
     }
 
     mv = memory_mod.MemoryVersion(

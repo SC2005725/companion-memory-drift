@@ -1,12 +1,16 @@
 # version-history
 
+> **历史快照（截止 2026-10-08）** —— 头部核对时间停在 2026-10-08（V0.2 · Phase 1-9），
+> 之后的 Phase 10/11、项目命名与发布副本同步未回填进本文件正文。
+> 当前状态与最新数字见仓库根目录的 `STATUS.md`（自动生成）。
+
 本文件描述**这个项目现在的真实状态**，不描述计划、不描述曾经的设想。
 与代码不一致的地方，一律以代码为准。
 
 - 版本：**V0.2 · Phase 1-9**
 - 最后核对时间：**2026-10-08**
 - 核对方式：五项自测全部实跑 + 数据库计数实测 + `archive-inventory.txt` 哈希逐条核验
-- 状态权威：**`archive-inventory.txt`**（本文件的 Phase 表与它一致）
+- 状态权威：**`STATUS.md`**（自动生成的状态快照，会变的数字以它为准）
 - ⚠️ **Phase 9 未封版** —— 逐项状态见文末 Phase 表
 - 📊 **会变的数字不写在本文件里** —— 见 `STATUS.md`（自动生成）
   本文件正文里的项数多为**当时**的实测值，已标注为「当时」；当前值一律以 `STATUS.md` 为准
@@ -168,7 +172,7 @@ memory-drift-experiment_V0.1_Phase1-3_min/
 ├── docs/project-report.md                 本项目的核对报告（含缺陷与文档错配清单）
 ├── docs/version-history.md             本文件
 ├── Phase4-计划.md              Phase 4/5 计划（部分已被project-spec取代）
-├── docs/project-spec.md               ★ 长期总指令，冲突时以它为准
+├── docs/project-spec.md               ★ 长期总指令：方向与原则冲突时以它为准；进度与数字见 STATUS.md
 ├── archive-inventory.txt                文件哈希清单（含归档后变更记录）
 ├── .env.example                空模板（**没有 .env**）
 ├── .gitignore

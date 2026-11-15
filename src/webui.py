@@ -25,7 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os             # 读 LOCALAPPDATA，决定令牌文件放哪
 import re
+import secrets          # 令牌生成与常量时间比较（secrets.compare_digest）
+import socket           # 取本机 IP，给手机经局域网访问时放行 Host/Origin
+import urllib.request   # 审批面板代理到 core_api（仅本机回环）
 
 # 图片引用只可能是我们自己算出来的内容寻址名。挡在这里，也挡在 images.load_image。
 _IMAGE_NAME_RE = re.compile(r"^[0-9a-f]{16}\.(png|jpg|gif|webp|bmp)$")
@@ -34,13 +38,204 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 SRC = Path(__file__).resolve().parent
 ROOT = SRC.parent
 sys.path.insert(0, str(SRC))
 
 HTML_FILE = SRC / "webui.html"
+
+# PWA 静态资源白名单：URL 路径 → src/ 下的文件名（**固定映射，不接受用户输入**）
+# 注意：manifest 与 sw.js 都**动态生成**（见 `_pwa_manifest` / `_pwa_sw`），
+# 因为 manifest 的 `start_url` 要带上令牌 —— 否则装好的 App 点开会 401。
+_PWA_ASSETS = {
+    "/icon-192.png": "icon-192.png",
+    "/icon-512.png": "icon-512.png",
+}
+
+# 最小 Service Worker：**只为满足「可安装」判据，不缓存任何东西**。
+# 有个空的 fetch 监听器就够；绝不拦截和缓存，避免界面变成旧版。
+_SW_JS = """// 小满 · 最小 Service Worker（不缓存）
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', () => { /* 一律走网络，不缓存 */ });
+"""
+
+# ---------------------------------------------------------------------------
+# 控制台编码兜底（2026-10-28 修）
+#
+# ## 踩到的坑
+#
+# Windows 控制台默认代码页是 **GBK**。启动提示里有 `⚠️` 这类字符，
+# `print` 时会抛：
+#     UnicodeEncodeError: 'gbk' codec can't encode character '\u26a0'
+# **界面还没开始监听就崩了**，而且只在没设 `PYTHONIOENCODING=utf-8` 时复现
+# —— 开发时用 utf-8 跑，正好把这个坑盖住。
+#
+# ## 为什么用 errors="replace" 而不是强制 utf-8
+#
+# 强制 utf-8 会让中文在 GBK 控制台里变成乱码；`replace` 保留控制台本身的编码
+# （GBK 本来就能显示中文），只把编不出来的符号（如 emoji）换成 `?`。
+# **中文照样看得懂，只是个别符号降级** —— 比崩溃好得多。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass    # 被重定向到不支持 reconfigure 的对象时就算了，别因此启动失败
+
+# ---------------------------------------------------------------------------
+# 访问控制（2026-10-26 加）
+#
+# 起因：界面原先【零鉴权】，且只靠 `bind 127.0.0.1` 当安全边界。
+# 但本机不是边界 —— 你打开任意一个恶意网页，它的 JS 就能 POST
+# `http://127.0.0.1:8765/api/env` 改掉 `.env`（读不到响应也无妨，
+# 侧效应已达成）；而白名单恰好允许改 `LLM_BASE_URL`，改完调
+# `/api/env/test` 就会把**真 Key 发往攻击者服务器**。
+#
+# 因此加四道，**都走同一个 `_guard()`**（一处守卫覆盖所有端点，
+# 好过在每个处理器里各加一遍 —— 漏一个就是洞）：
+#
+#   ① Host 校验     —— 防 DNS rebinding
+#   ② Origin 校验   —— 防跨源 CSRF（恶意网页必带自己的 Origin）
+#   ③ 自定义请求头  —— POST 强制带 `X-Xiaoman-Request`，会触发 CORS 预检，
+#                      恶意网页的「简单请求」伪造不了
+#   ④ Token 校验    —— httpOnly cookie；**不放 query string**
+#                      （图片响应是 `max-age=31536000`，URL 带 token 会被缓存一年）
+#
+# 用标准库 `secrets` + `hmac.compare_digest`，**不新增依赖**。
+# ---------------------------------------------------------------------------
+
+_TOKEN = ""                    # 启动时取（见 main()：优先持久文件）
+_HOME_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+# ---------------------------------------------------------------------------
+# 令牌持久化（2026-10-31 加）
+#
+# ## 为什么需要
+#
+# 原来每次启动都随机生成新令牌。装上桌面 App 之后，**电脑一重启令牌就变**，
+# App 点开显示「未授权」—— 每次都得重新复制链接，那就白装了。
+#
+# ## 为什么存在项目目录【外面】
+#
+# `_build_publish.py` 的 `INCLUDE_DIRS = ["src", "config", "personality"]`
+# 会把这些目录**同步到公开的发布副本**。令牌放进去就等于进版本库。
+# 所以放 `%LOCALAPPDATA%\xiaoman\`。
+#
+# ## 安全说明（如实）
+#
+# 这是**明文文件**，长期不变 —— 比每次随机弱一点。
+# 但它和 `.env`（存着 API Key）处同一安全级别：本机用户可读。
+# 想换令牌：删掉这个文件再启动即可。
+# ---------------------------------------------------------------------------
+_TOKEN_FILE = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "xiaoman" / "webui-token"
+
+
+def _load_or_create_token() -> str:
+    """读持久令牌；没有/太短就生成并写回。任何失败都不阻断启动。"""
+    try:
+        if _TOKEN_FILE.is_file():
+            old = _TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if len(old) >= 32:
+                return old
+    except OSError:
+        pass
+
+    fresh = secrets.token_urlsafe(32)
+    try:
+        _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _TOKEN_FILE.write_text(fresh, encoding="utf-8")
+        try:
+            os.chmod(_TOKEN_FILE, 0o600)      # 尽量只给本人读写（Windows 上可能无效）
+        except OSError:
+            pass
+    except OSError:
+        pass                                   # 写不了就用内存里的，功能不受影响
+    return fresh
+
+# ---------------------------------------------------------------------------
+# 允许的 Host / Origin（2026-10-28 扩）
+#
+# ## 为什么原来只有回环地址，现在要加本机 IP
+#
+# 手机经局域网访问时写的是 `http://192.168.1.2:8765/`，于是：
+#   · Host 头 = `192.168.1.2:8765`
+#   · Origin  = `http://192.168.1.2:8765`
+# 两者都不在 `_HOME_HOSTS` 里 → **403，手机根本连不上**。
+#
+# 所以把「**本机自己**的 IPv4」和「当前绑定地址」加进白名单。
+#
+# ## 这样加安全吗
+#
+# 安全：这些地址**就是这台机器本身**，放行它们不等于放行外人。
+# Host 校验防的是 **DNS rebinding** —— 攻击者让它自己的域名解析到
+# `192.168.1.2`，但请求带的 Host 仍是 `evil.example` → 依然被拒 ✅
+# Origin 校验防的是跨源 CSRF —— 恶意页面带的是它自己的 Origin → 依然被拒 ✅
+#
+# **令牌仍然必查**，局域网不等于免鉴权。
+# ---------------------------------------------------------------------------
+_ALLOWED_HOSTS: set[str] = set(_HOME_HOSTS)
+
+
+def _is_tailscale_ip(host: str) -> bool:
+    """是不是 Tailscale 的地址（100.64.0.0/10）。
+
+    Tailscale 给每台设备分 `100.64.x.x`–`100.127.x.x` 的地址。
+    放行这个网段是安全的：**只有你自己 tailnet 里的设备能到这个地址**，
+    外部互联网根本路由不到它 —— 不像公网隧道那样把服务暴露出去。
+
+    另外 `*.ts.net` 是 `tailscale serve` 给 HTTPS 用的域名，也一并放行。
+    """
+    if host.endswith(".ts.net"):
+        return True
+    parts = host.split(".")
+    if len(parts) != 4 or parts[0] != "100":
+        return False
+    try:
+        second = int(parts[1])
+    except ValueError:
+        return False
+    return 64 <= second <= 127        # 100.64.0.0/10 的第二段范围
+
+
+def _host_ok(host: str) -> bool:
+    """Host / Origin 里出现的主机名是否允许。"""
+    return host in _ALLOWED_HOSTS or _is_tailscale_ip(host)
+
+
+def _own_ipv4() -> set[str]:
+    """本机自身的 IPv4（用来放行「手机经局域网访问」时出现的 Host/Origin）。
+
+    两种取法并集，任一失败都不影响另一种：
+      · UDP connect 到外部地址**不发包**，只借它选出出口网卡地址
+      · gethostbyname_ex 兜底（多网卡时能拿到更多）
+    """
+    found: set[str] = set()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))     # 注意：UDP connect 不产生流量
+            found.add(sock.getsockname()[0])
+        finally:
+            sock.close()
+    except OSError:
+        pass
+    try:
+        found.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    # 回环另有条目（127.0.0.1），这里只要真实网卡地址
+    return {ip for ip in found if ip and not ip.startswith("127.")}
+
+# 只控制一件事：**远程请求能不能改 `LLM_BASE_URL`**。
+# 默认 False。放启动参数，**不上网页 UI**（否则等于把开关交给攻击者）。
+# ⚠️ 打开它**不豁免** Host / Origin / 自定义头 / Token 四道校验。
+REMOTE_CONFIG_WRITE = False
+
+# 改动 `LLM_BASE_URL` 时，非本机来源要求这个开关打开
+_SENSITIVE_ENV_KEYS = frozenset({"LLM_BASE_URL"})
 
 # 会话在进程内保持一个，这样界面里连续说话属于同一段会话（上下文不断）。
 # **但数据库连接每请求新建** —— 连接不跨线程用，避免 sqlite3 的线程限制。
@@ -188,6 +383,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")   # 防 token 经 Referer 外泄
+        self.send_header("X-Frame-Options", "DENY")          # 防被 iframe 套
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -197,6 +395,65 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code: int = 200) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
+
+    # -- 访问控制 -------------------------------------------------------------
+
+    def _is_local_client(self) -> bool:
+        """请求是否来自本机。**用对端地址判断，不看 Host 头**（Host 可伪造）。"""
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _cookie_token(self) -> str:
+        """从 Cookie 里取令牌。**不用 query string** —— 那会被缓存与留在历史里。"""
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "xiaoman_token":
+                return v
+        return ""
+
+    def _guard(self, *, is_bootstrap: bool = False) -> bool:
+        """四道校验，返回 True 才放行。
+
+        `is_bootstrap=True` 只用于 `GET /?token=…` 那一次引导（此时还没有 cookie）。
+        **即使引导，①②③也照查** —— 引导只是省掉第 ④ 道的 cookie 要求。
+        """
+        port = self.server.server_address[1]
+
+        # ① Host —— 防 DNS rebinding
+        # 允许集 = 回环 + 本机自身 IP + Tailscale 地址 + `--allow-host` 显式指定的域名
+        # 攻击者域名即使解析到本机 IP，Host 仍是它自己的域名 → 照样被拒。
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip().lower()
+        if not _host_ok(host):
+            self._json({"ok": False, "error": "非法 Host"}, 403)
+            return False
+
+        # ② Origin —— 浏览器发跨源请求一定带 Origin，同源才放行
+        origin = self.headers.get("Origin")
+        if origin:
+            ok = False
+            for scheme in ("http", "https"):
+                prefix = f"{scheme}://"
+                if origin.rstrip("/").startswith(prefix):
+                    o_host = origin.rstrip("/")[len(prefix):].rsplit(":", 1)[0].lower()
+                    if _host_ok(o_host):
+                        ok = True
+                        break
+            if not ok:
+                self._json({"ok": False, "error": "跨源请求被拒绝"}, 403)
+                return False
+
+        # ③ POST 强制自定义头 —— 触发 CORS 预检，恶意网页的简单请求伪造不了
+        if self.command == "POST" and self.headers.get("X-Xiaoman-Request") != "1":
+            self._json({"ok": False, "error": "缺少请求标记"}, 403)
+            return False
+
+        # ④ Token
+        if is_bootstrap:
+            return True
+        if not _TOKEN or not secrets.compare_digest(self._cookie_token(), _TOKEN):
+            self._json({"ok": False, "error": "未授权：请用启动时打印的地址打开界面"}, 401)
+            return False
+        return True
 
     def _read_json(self) -> dict:
         try:
@@ -219,15 +476,30 @@ class Handler(BaseHTTPRequestHandler):
         # 顶层兜底：任何未预料的异常都要变成 500 响应，
         # 而不是让连接**直接断掉**（那样前端只能看到「连不上后端」，查不出原因）。
         try:
+            if not self._guard(is_bootstrap=self._is_bootstrap()):
+                return
             self._route_get()
         except Exception as exc:
             self._safe_error(exc)
 
     def do_POST(self) -> None:
         try:
+            if not self._guard():
+                return
             self._route_post()
         except Exception as exc:
             self._safe_error(exc)
+
+    # 未定义方法显式拒绝 —— 不要落到默认行为
+    def _method_not_allowed(self) -> None:
+        self._send(405, b"method not allowed", "text/plain; charset=utf-8")
+
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _method_not_allowed
+
+    def _is_bootstrap(self) -> bool:
+        """`GET /?token=…` —— 一次性引导，用来把令牌写进 httpOnly cookie。"""
+        return (self.command == "GET" and urlparse(self.path).path in ("/", "/index.html")
+                and "token=" in (urlparse(self.path).query or ""))
 
     def _safe_error(self, exc: BaseException) -> None:
         try:
@@ -236,9 +508,85 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass   # 连错误都发不出去就没办法了，至少不让它冒泡
 
+    # -- CE-4 审批面板代理（2026-11-08）---------------------------------------
+    # webui 不落任何审批状态，纯转发到本机 core_api（带核心令牌）。
+    # 鉴权走 _guard 统一护栏（令牌 cookie + 同源 + POST 自定义头）。
+
+    def _core_token(self) -> str:
+        """核心服务令牌（本机同盘文件，不经网络传输）。"""
+        p = HTML_FILE.parent.parent / "core" / "api-token"
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _approvals_proxy(self, method: str) -> None:
+        if method == "POST":
+            body = self._read_json()
+            decision = str(body.get("decision") or "").lower()
+            if decision not in ("approve", "deny"):
+                self._json({"ok": False, "error": "decision 只能是 approve/deny"}, 400)
+                return
+            payload = {"approval_id": str(body.get("approval_id") or ""),
+                       "decision": decision,
+                       "decided_by": "boss-webui",
+                       "note": body.get("note")}
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                "http://127.0.0.1:8770/api/approvals/decide", data=data,
+                headers={"Authorization": f"Bearer {self._core_token()}",
+                         "Content-Type": "application/json"}, method="POST")
+        else:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8770/api/approvals/list?status=pending",
+                headers={"Authorization": f"Bearer {self._core_token()}"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            self._json(out, 200)
+        except Exception as exc:  # noqa: BLE001
+            self._json({"ok": False,
+                        "error": f"核心服务不可达（127.0.0.1:8770，"
+                                 f"{type(exc).__name__}）——启动核心服务了吗？"}, 502)
+
+    def _components_proxy(self) -> None:
+        """HealthBoard 透传：各部件健康（中枢制 v2）。"""
+        token = self._core_token()
+        if not token:
+            self._json({"ok": False, "error": "读不到核心令牌"}, 502)
+            return
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    "http://127.0.0.1:8770/api/health/components",
+                    headers={"Authorization": f"Bearer {token}"}), timeout=8) as r:
+                self._json(json.loads(r.read().decode("utf-8")), 200)
+        except Exception as exc:  # noqa: BLE001
+            self._json({"ok": False, "error": f"核心服务不可达（{type(exc).__name__}）"}, 502)
+
     def _route_get(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path in ("/", "/index.html"):
+            # 引导：`/?token=…` → 校验通过就写 httpOnly cookie 并**立刻重定向**，
+            # 令牌不留在地址栏、不进历史、不被图片缓存规则带走。
+            if parsed.query:
+                given = (parse_qs(parsed.query).get("token") or [""])[0]
+                if _TOKEN and secrets.compare_digest(given, _TOKEN):
+                    self.send_response(302)
+                    self.send_header("Location", "/")
+                    self.send_header("Set-Cookie",
+                                     # Max-Age：桌面 App 反复开关时不用重新贴令牌。
+                                     # 7 天，且【服务重启后令牌会变】—— 所以它只是
+                                     # 「同一次运行期间免重输」，不是长期凭据。
+                                     f"xiaoman_token={_TOKEN}; HttpOnly; SameSite=Strict; "
+                                     f"Path=/; Max-Age={7 * 24 * 3600}")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.end_headers()
+                    return
+                self._send(401, "令牌不正确。请用启动时打印的完整地址打开。".encode("utf-8"),
+                           "text/plain; charset=utf-8")
+                return
             if not HTML_FILE.exists():
                 self._send(500, f"缺少界面文件：{HTML_FILE}".encode("utf-8"),
                            "text/plain; charset=utf-8")
@@ -254,11 +602,98 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/env":
             self._env_status()
             return
+        # ---- CE-4 审批面板（2026-11-08）：代理到 core_api -------------------
+        # 鉴权已由 _guard 统一兜住（令牌 cookie + 同源）；这里只是把请求
+        # 转发给本机 core_api（带核心令牌），高危动作的批准入口。
+        if path == "/api/approvals":
+            self._approvals_proxy("GET")
+            return
+        if path == "/api/components":
+            self._components_proxy()
+            return
+        # ---- PWA 静态资源（2026-10-31 加，让手机能把它装成 App）----
+        # 只放行白名单里的文件名，**不做目录读取** —— 别把 src/ 暴露成静态目录。
+        if path in _PWA_ASSETS:
+            self._pwa_asset(_PWA_ASSETS[path])
+            return
+        if path == "/webui.webmanifest":
+            self._pwa_manifest()
+            return
+        if path == "/sw.js":
+            self._pwa_sw()
+            return
         # 图片回显：`<img src="/uploads/<name>">`
         if path.startswith("/uploads/"):
             self._image_serve(path[len("/uploads/"):])
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _pwa_manifest(self) -> None:
+        """动态生成 manifest。
+
+        ## 为什么不能是静态文件
+
+        `start_url` 必须带上令牌 —— 否则装好的 App 点开是「未授权」。
+        而令牌是每次启动确定的（现已持久化），所以在这里拼。
+
+        ## Chrome 的「可安装」判据（缺一项就不给安装按钮）
+
+        · `name` 或 `short_name`  ✅
+        · `icons` 含 192 与 512    ✅
+        · `start_url`              ✅（带令牌）
+        · `display` = standalone   ✅
+        · HTTPS 提供               ✅（走 tailscale serve）
+        · 已注册 Service Worker    ✅（见 /sw.js）
+        """
+        manifest = {
+            "name": "鹤辞",
+            "short_name": "鹤辞",
+            "description": "共生 Companion —— 你的鹤辞，随身带着",
+            "lang": "zh-CN",
+            "id": "/",
+            # 装好后点图标直接带令牌进去，不用再贴链接
+            "start_url": f"/?token={_TOKEN}",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#1a2038",
+            "theme_color": "#1a2038",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            ],
+        }
+        body = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+        self._send(200, body, "application/manifest+json; charset=utf-8")
+
+    def _pwa_sw(self) -> None:
+        """回最小 Service Worker（不缓存，只为满足安装判据）。"""
+        self._send(200, _SW_JS.encode("utf-8"), "text/javascript; charset=utf-8")
+
+    def _pwa_asset(self, filename: str) -> None:
+        """回一个 PWA 静态文件。文件名固定（来自 `_PWA_ASSETS`），不接受用户输入。"""
+        target = SRC / filename
+        if not target.is_file():
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        mime = {
+            ".webmanifest": "application/manifest+json; charset=utf-8",
+            ".png": "image/png",
+        }.get(target.suffix, "application/octet-stream")
+        data = target.read_bytes()
+        # 图标按内容长期缓存；manifest 走 no-store（改完要立刻生效）
+        cache = ("public, max-age=86400" if target.suffix == ".png" else "no-store")
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _image_serve(self, name: str) -> None:
         """回显一张已存的图。**名字不合规或不存在就是 404**，不回退到别的路径。"""
@@ -283,6 +718,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/chat":
             self._chat()
+            return
+        if path == "/api/approvals/decide":
+            self._approvals_proxy("POST")
             return
         if path == "/api/env":
             self._env_save()
@@ -369,6 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         saved, errors = [], []
+        remote = not self._is_local_client()
         for key, value in updates.items():
             if not isinstance(value, str):
                 errors.append(f"{key}：值必须是字符串")
@@ -376,6 +815,11 @@ class Handler(BaseHTTPRequestHandler):
             value = value.strip()
             if not value:
                 continue          # 空值 = 不改这一项
+            # 敏感项：远程来源必须显式打开 REMOTE_CONFIG_WRITE 才允许改。
+            # 默认 False —— 因为「改 LLM_BASE_URL」= 把真 Key 送去别的地址。
+            if remote and key in _SENSITIVE_ENV_KEYS and not REMOTE_CONFIG_WRITE:
+                errors.append(f"{key}：不允许远程修改（需以 --remote-config-write 启动）")
+                continue
             try:
                 save_env_value(key, value)
                 saved.append(key)   # 只记键名，不记值
@@ -397,11 +841,23 @@ class Handler(BaseHTTPRequestHandler):
                     "note": "已写入 .env（本地明文保存；不要把这个文件发给别人）"})
 
     def _env_test(self) -> None:
-        """用当前 Key 发一次**最小**请求验证可用性。
+        """用 Key 发一次**最小**请求验证可用性。
 
         **这会花一次钱**（极少，约几百个 token）。界面上要提前说清。
+
+        ## ⚠️ 2026-10-26 安全修复（**这次就改，不留到以后**）
+
+        原来这里写的是 `api_key = candidate or env.api_key` —— 不传 `key` 就
+        **回落到 `.env` 里存的真 Key**，而 `base_url` 用的是**文件里的最新值**。
+        两者一凑就是一条完整的偷 Key 链：
+
+            ① POST /api/env   改 LLM_BASE_URL 指向攻击者服务器
+            ② POST /api/env/test  （不带 key）→ 真 Key 发往那个地址
+
+        **现在**：不带 `key` 时，**只有端点是已知默认端点**才允许用存储的 Key。
+        端点被改过 → 必须**重新输入 Key** 才测（输入什么就测什么，不回落到存储值）。
         """
-        from config import load_env, load_settings, resolve_model
+        from config import DEFAULT_BASE_URL, load_env, load_settings, resolve_model
 
         payload = self._read_json()
         if not isinstance(payload, dict):
@@ -416,6 +872,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             settings = load_settings()
             env = load_env(fresh=True)      # 先用文件里的最新值覆盖进程环境
+            # —— 安全闸：不允许把【存储的真 Key】发往【非默认端点】——
+            if not candidate and env.base_url.rstrip("/") != DEFAULT_BASE_URL.rstrip("/"):
+                self._json({"ok": False,
+                            "error": "端点已被改为非默认地址，为安全起见必须重新输入 Key 才能测试。"
+                                     "（不会把已保存的 Key 发往新地址）"}, 400)
+                return
             api_key = candidate or env.api_key
             if not api_key:
                 self._json({"ok": False, "error": "还没有填 API Key"}, 400)
@@ -528,6 +990,21 @@ class Handler(BaseHTTPRequestHandler):
                 result = chat.send_once(session, text, echo=lambda *_: None,
                                         user_image=image)
                 turn = result.get("turn") or {}
+
+                # P0-1：真实对话自动进入主体事件账本。
+                # 同理放真实入口，不放 send_once；失败不影响这轮回复。
+                try:
+                    import core_capture
+
+                    core_capture.record_turn(
+                        instance_id="heci_001_dsh",
+                        session_id=getattr(session, "session_id", None),
+                        turn=turn,
+                        result=result,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
                 try:
                     status = collect_status(conn, settings)
                 except Exception:
@@ -559,11 +1036,77 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
 
 
+def _startup_refusal(host: str, token: str) -> str:
+    """启动硬规则。返回空串 = 可以启动；非空 = 拒绝理由。
+
+    两条**不可绕过**（想要远程，就必须先有合格的令牌）：
+      1. 令牌为空或短于 32 字节 → 拒绝
+      2. 绑定非本机地址但没有可用令牌 → 拒绝
+
+    独立成函数是为了能被测试直接调用（不必真的去 bind）。
+    """
+    if not token or len(token) < 32:
+        return "令牌为空或短于 32 字节 —— 拒绝启动（这会让界面变成零鉴权）"
+    if host not in _HOME_HOSTS and not token:
+        return f"绑定非本机地址 {host} 但没有可用令牌 —— 拒绝启动"
+    return ""
+
+
+def _log_startup(host: str, port: int) -> None:
+    """把界面启动时的安全姿态记进 run.log（出事后能查当时开没开）。"""
+    try:
+        from datetime import datetime
+
+        log = ROOT / "logs" / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        line = (f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                f"webui 启动：host={host} port={port} "
+                f"token={'on' if _TOKEN else 'off'} "
+                f"remote_config_write={'on' if REMOTE_CONFIG_WRITE else 'off'}\n")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass   # 记不上日志不该阻止界面启动
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="小满 · 本地网页界面")
+    global _TOKEN, REMOTE_CONFIG_WRITE
+
+    ap = argparse.ArgumentParser(description="鹤辞 · 本地网页界面")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="绑定地址，默认 127.0.0.1（只本机）。"
+                         "要手机经局域网访问用 --host 0.0.0.0")
+    ap.add_argument("--remote-config-write", action="store_true",
+                    help="允许【远程】请求修改 LLM_BASE_URL（默认否）。"
+                         "打开它不豁免令牌/Origin/Host/自定义头校验。")
+    ap.add_argument("--token", default="", help=argparse.SUPPRESS)   # 仅供测试注入
+    ap.add_argument("--allow-host", action="append", default=[],
+                    metavar="HOST",
+                    help="额外放行的主机名（可重复）。例如 Tailscale 的 "
+                         "xxx.tailnet.ts.net，或自定义域名。"
+                         "Tailscale 的 100.64.0.0/10 与 *.ts.net 已自动放行，一般不用填。")
     ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     args = ap.parse_args()
+
+    # 令牌：`--token` 优先（仅供测试）；否则用持久文件里的，没有就生成一个新的。
+    # 持久化的意义：桌面 App 装好之后，电脑重启也不会失效。
+    _TOKEN = args.token or _load_or_create_token()
+    REMOTE_CONFIG_WRITE = bool(args.remote_config_write)
+
+    # 允许集：回环 + 本机自身 IP + 具体绑定地址 + 命令行显式指定的域名
+    # （手机经局域网访问时 Host/Origin 会是本机 IP；经 Tailscale 时是 100.x / *.ts.net）
+    _ALLOWED_HOSTS.update(_own_ipv4())
+    for extra in args.allow_host or []:
+        if extra.strip():
+            _ALLOWED_HOSTS.add(extra.strip().lower())
+    if args.host not in ("", "0.0.0.0", "::"):
+        _ALLOWED_HOSTS.add(args.host.lower())
+
+    refusal = _startup_refusal(args.host, _TOKEN)
+    if refusal:
+        print(f"[拒绝启动] {refusal}")
+        return 2
 
     if not HTML_FILE.exists():
         print(f"[错误] 缺少界面文件：{HTML_FILE}")
@@ -586,7 +1129,7 @@ def main() -> int:
     httpd = None
     for port in range(args.port, args.port + 20):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            httpd = ThreadingHTTPServer((args.host, port), Handler)
             break
         except OSError:
             continue
@@ -594,14 +1137,32 @@ def main() -> int:
         print(f"[错误] {args.port}–{args.port + 19} 端口都被占用")
         return 1
 
-    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    actual_port = httpd.server_address[1]
+    _log_startup(args.host, actual_port)
+
+    # 引导地址带令牌 → 打开即写入 httpOnly cookie 并重定向，令牌不留在地址栏
+    bound_wild = args.host in ("0.0.0.0", "::")
+    local_url = f"http://127.0.0.1:{actual_port}/?token={_TOKEN}"
     print("=" * 56)
-    print("小满 · 本地界面已启动")
-    print(f"  地址：{url}")
-    print("  只监听本机；关掉这个窗口即结束")
+    print("小满 · 界面已启动")
+    print(f"  本机地址：{local_url}")
+    if bound_wild:
+        # 监听所有网卡 → 列出手机可用的局域网地址
+        for ip in sorted(_own_ipv4()):
+            print(f"  手机地址：http://{ip}:{actual_port}/?token={_TOKEN}")
+    elif args.host.lower() not in _HOME_HOSTS:
+        print(f"  手机地址：http://{args.host}:{actual_port}/?token={_TOKEN}")
+    print(f"  绑定：{args.host}" + ("（所有网卡，手机可访问）" if bound_wild
+                                 else "（只本机）" if args.host in _HOME_HOSTS else ""))
+    print(f"  令牌：已启用（{len(_TOKEN)} 字符）")
+    print(f"  令牌来源：{'命令行 --token' if args.token else str(_TOKEN_FILE)}")
+    print("           （持久化 → 电脑重启后 App 仍能用；想换令牌就删掉这个文件）")
+    print(f"  远程改 LLM_BASE_URL：{'允许 ⚠️' if REMOTE_CONFIG_WRITE else '禁止（默认）'}")
+    print("  ⚠️ 带令牌的地址等同于密码，不要发给别人。")
+    print("  关掉这个窗口即结束")
     print("=" * 56)
     if not args.no_open:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: webbrowser.open(local_url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

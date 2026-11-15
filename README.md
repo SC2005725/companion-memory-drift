@@ -44,7 +44,7 @@
 
 **如果这个项目对你有用，点一个 Star，方便以后回来，也让更多在做同类实验的人更容易发现它。**
 
-**📖 文档站：https://SC2005725.github.io/companion-memory-drift/** ｜ 详细进度见 [`docs/project-report.md`](docs/project-report.md)
+**📖 文档站：https://SC2005725.github.io/companion-memory-drift/** ｜ 详细进度见 [`STATUS.md`](STATUS.md)（自动生成，唯一权威）
 
 ---
 
@@ -174,7 +174,7 @@ python src/dryrun.py
 - 工具层**不绑死任何 Agent 平台**，权限边界从配置来
 
 > ⚠️ **Phase 9 尚未封版** —— `run_python` 真实使用与注入面系统测试还没做。
-> 详见第 2 节的状态表，那里是**唯一权威**的进度说明。
+> 详见仓库根目录的 [`STATUS.md`](STATUS.md)（由 `src/status_snapshot.py` 实跑生成），那里是**唯一权威**的进度说明。
 
 开发前的可行性分析（复用调研、成本估算、风险清单）见 `docs/feasibility.md`。
 本机读文档请以 **`docs/version-history.md`** 为准。

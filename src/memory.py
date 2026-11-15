@@ -20,13 +20,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
+import uuid
 from dataclasses import dataclass, field, asdict
 
 from paths import VERSIONS_DIR, ensure_dirs
 
 # 证据等级。推断不得伪装成事实。
-VALID_TYPES = ("FACT", "INFERENCE", "UNKNOWN")
+# "EPISODE"（2026-11-08 处方 A）：情景记忆——"那次我们一起…"的带温度经历，
+# 与 FACT（语义事实）分型。业界共识：人格一致性靠情景记忆锚定（ZifaMem 等）。
+VALID_TYPES = ("FACT", "EPISODE", "INFERENCE", "UNKNOWN")
 
 # ---------------------------------------------------------------------------
 # B1：记忆**来源**标记（remembered / reconstructed / inferred）
@@ -48,6 +53,7 @@ PROVENANCES = (PROVENANCE_REMEMBERED, PROVENANCE_RECONSTRUCTED, PROVENANCE_INFER
 
 _TYPE_TO_PROVENANCE = {
     "FACT": PROVENANCE_REMEMBERED,
+    "EPISODE": PROVENANCE_REMEMBERED,   # 经历=亲历（处方 A），与 FACT 同来源档
     "INFERENCE": PROVENANCE_INFERRED,
     # UNKNOWN → None：不知道就是不知道，不硬塞一个来源
 }
@@ -539,7 +545,14 @@ def existing_versions() -> list[str]:
     for path in VERSIONS_DIR.glob("v*.json"):
         if _VERSION_RE.match(path.stem):
             out.append(path.stem)
-    return sorted(out)
+
+    def _vnum(s: str) -> int:
+        m = _VERSION_RE.match(s)
+        return int(m.group(1)) if m else 0
+
+    # P1（v1000 数值排序）：字典序 v999 > v1000，load_latest 会拿到旧版。
+    # 按数值排，调用方（load_latest / next_version_name）语义不变。
+    return sorted(out, key=_vnum)
 
 
 def next_version_name() -> str:
@@ -615,27 +628,95 @@ def enforce_traceable_removal(
         )
 
 
+# 雷 7（2026-11-07 深度审查）：版本落盘的跨进程护栏参数。
+# 陈锁阈值取 30s：正常写一个版本 <1s，超过 30s 必是持有者崩了。
+_LOCK_STALE_SECONDS = 30.0
+_LOCK_WAIT_SECONDS = 10.0
+
+
+def _acquire_version_lock(version: str):
+    """跨进程写锁（雷 7）：`O_CREAT|O_EXCL` 独占创建，抢不到就等。
+
+    两个进程同时整理记忆（心跳 + 手动触发是真实场景）时，旧版的
+    "exists 检查 + write_text" 是 TOCTOU：双方都看见"不存在"，后写者把
+    先写者的版本整个覆盖，append-only 证据链被击穿，sidecar 一起被覆盖，
+    verify 还会对**错误内容**报"通过"。锁把同版本的写入串行化。
+    锁龄超过 30 秒视为持有者已崩溃，破锁接管（锁文件是普通文件，
+    不依赖平台特定锁原语，Windows / POSIX 行为一致）。
+    """
+    lock = VERSIONS_DIR / f".{version}.save.lock"
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > _LOCK_STALE_SECONDS:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() > deadline:
+                raise MemoryError(
+                    f"另一进程疑似正在写记忆版本 {version}"
+                    f"（锁等待超时 {_LOCK_WAIT_SECONDS:g}s）。"
+                    "若确认没有其他进程在写，可手动删除 "
+                    f"{lock.name} 后重试。"
+                ) from None
+            time.sleep(0.05)
+
+
+def _atomic_write(path, body: str) -> None:
+    """tmp + `os.replace` 原子落盘（雷 7）。
+
+    同目录临时文件保证与目标同盘（rename 原子性）；`open(tmp, "x")`
+    独占创建避免并发 tmp 互撞；进程写到一半崩溃只会留下 tmp 残骸，
+    目标路径要么不存在要么是完整内容 —— 半截文件从此不可能出现。
+    tmp 残骸命名带 pid/uuid，且不匹配 `v*.json` glob，不污染版本枚举。
+    """
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        with open(tmp, "x", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def save_version(mv: MemoryVersion) -> dict:
     """把一个记忆版本写成新文件。**已存在则抛错，绝不覆盖。**
 
     返回 {file, sha256}。sha256 覆盖文件正文（不含末尾换行），
     与原始事件的校验口径保持一致（见 storage.create_event）。
+
+    雷 7 修复（2026-11-07）：跨进程锁串行化同版本写入（陈锁 30s 自动破）；
+    锁内复查 exists（"拒绝覆盖"从此真正不可越过）；正文与 sidecar 都走
+    tmp + os.replace 原子落盘（半截文件不可能出现；两步 replace 之间
+    崩溃最坏留下"有版本无 sidecar"，verify 会明确报 missing_sidecar，
+    不再是静默损坏）。
     """
     ensure_dirs()
     path = version_path(mv.version)
-    if path.exists():
-        raise MemoryError(
-            f"记忆版本文件已存在，拒绝覆盖：{path.name}。"
-            "版本快照是实验证据，不允许改写。"
-        )
 
     body = json.dumps(mv.to_dict(), ensure_ascii=False, sort_keys=True, indent=2)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
-    path.write_text(body + "\n", encoding="utf-8")
-    (VERSIONS_DIR / f"{mv.version}.sha256").write_text(
-        f"{digest}  {mv.version}.json\n", encoding="utf-8"
-    )
+    lock = _acquire_version_lock(mv.version)
+    try:
+        if path.exists():
+            raise MemoryError(
+                f"记忆版本文件已存在，拒绝覆盖：{path.name}。"
+                "版本快照是实验证据，不允许改写。"
+            )
+        _atomic_write(path, body + "\n")
+        _atomic_write(VERSIONS_DIR / f"{mv.version}.sha256",
+                      f"{digest}  {mv.version}.json\n")
+    finally:
+        lock.unlink(missing_ok=True)
     return {"file": f"memory/versions/{mv.version}.json", "sha256": digest}
 
 
@@ -647,20 +728,40 @@ def load_version(version: str) -> MemoryVersion:
 
 
 def load_latest() -> MemoryVersion | None:
+    """最新**可读**版本（P1：半截文件回退，2026-11-08）。
+
+    之前：最新版是半截 JSON → load_version 抛异常 → 检索全挂、retrievals
+    也落不了盘（违反 P0「空结果也必须落盘」）。现在从新到旧逐个试读，
+    损坏/半截的跳过并回退上一版；不删不改名（证据链只追加，留给 verify
+    去报错）。全部不可读 → None（与"没有版本"同路，不崩）。
+    """
     versions = existing_versions()
-    if not versions:
-        return None
-    return load_version(versions[-1])
+    for version in reversed(versions):
+        try:
+            return load_version(version)
+        except Exception as exc:  # noqa: BLE001 —— 单文件坏不拖死检索
+            print(f"[memory] 版本 {version} 不可读已跳过（半截文件回退）："
+                  f"{type(exc).__name__}")
+            continue
+    return None
 
 
-def verify_versions() -> dict:
+def verify_versions(db_sha: dict[str, str] | None = None) -> dict:
     """校验每个版本文件与其 .sha256 是否一致，并检查是否有未登记的文件。
 
     只读操作。与 verify.py 对原始事件的口径一致。
+
+    雷 7 补强（2026-11-07）：传 `db_sha`（version → file_sha256，来自
+    storage.list_memory_versions 的登记值）时额外做**第三方见证比对** ——
+    旧版只对"文件 vs sidecar"，而这俩在竞态覆盖事故里是**一起**被覆盖的，
+    校验照样全绿；DB 登记值由另一条写入路径落账，独立于文件系统。
+    memory.py 刻意不 import storage（保持底层无依赖），由调用方喂字典。
     """
     report = {"checked": 0, "ok": True, "errors": [], "missing_sidecar": []}
+    seen: set[str] = set()
     for version in existing_versions():
         report["checked"] += 1
+        seen.add(version)
         path = version_path(version)
         sidecar = VERSIONS_DIR / f"{version}.sha256"
         body = path.read_text(encoding="utf-8").rstrip("\n")
@@ -673,6 +774,16 @@ def verify_versions() -> dict:
         if recorded != digest:
             report["ok"] = False
             report["errors"].append(f"{version}：文件内容与 .sha256 不一致")
+        if db_sha and version in db_sha and str(db_sha[version]) != digest:
+            report["ok"] = False
+            report["errors"].append(
+                f"{version}：文件内容与 DB 登记的 file_sha256 不一致"
+                "（版本文件或登记账被改过）")
+    if db_sha:
+        for version in sorted(set(db_sha) - seen):
+            report["ok"] = False
+            report["errors"].append(
+                f"{version}：DB 有登记但版本文件不存在（账实不符）")
     return report
 
 
@@ -949,7 +1060,8 @@ def _identity_applicable(query: str, item: "MemoryItem") -> bool:
     return reveals_name(item.text)
 
 
-def _score(item: MemoryItem, query_tokens: list[str], *, identity_query: bool = False) -> float:
+def _score(item: MemoryItem, query_tokens: list[str], *, identity_query: bool = False,
+           pref_query: bool = False) -> float:
     """按重叠长度加权打分。
 
     ## 为什么单字必须有，但只能算很低的权重
@@ -995,6 +1107,20 @@ def _score(item: MemoryItem, query_tokens: list[str], *, identity_query: bool = 
         strong = 1   # 给一个基础分，让它能进入候选
 
     score = strong + weak * 0.15
+
+    # M-4（记忆优化批 2026-11-15）：偏好类条目加权。
+    # bench 实测 single-session-preference 正确率 30%（30 题里 17 题零召回）——
+    # 偏好问法与偏好条目常只有少量 ≥2 字重叠，同分之下被普通条目挤掉。
+    # category 含「偏好」且至少一次 ≥2 字强命中的条目 +0.6：足以顶掉同分普通
+    # 条目，不足以让弱命中压过强命中。只认 strong≥1 —— 单字提权重是踩过的
+    # 坑（上方教训），绝不重蹈。
+    #
+    # M-4 修正（找问题轮 2026-11-15）：加 **查询侧门控 pref_query** ——只有
+    # 查询本身是偏好类（「喝什么/口味/推荐」…）才允许偏好加权。修正前
+    # 任何查询只要碰上偏好条目的词就 +0.6，实测「看什么书」的 top-20 被
+    # 12 条偏好条目霸榜（非偏好查询误伤）。
+    if pref_query and strong >= 1 and "偏好" in (item.category or ""):
+        score += 0.6
 
     # 身份查询下，**揭示姓名的条目**直接加分到最高优先。
     # 只认 reveals_name（真带姓名），不认泛泛的「叫什么名字」推断。
@@ -1092,6 +1218,143 @@ def privacy_withhold(
     return kept, withheld
 
 
+# ---------------------------------------------------------------------------
+# M-4 / M-5（记忆优化批 2026-11-15）：偏好兜底 + 查询侧时间窗
+# ---------------------------------------------------------------------------
+
+# M-4：偏好类查询的触发词。bench 病灶：偏好题 30%，问法与偏好条目的词面
+# 常**完全错开**（「口味如何」vs「偏好拿铁」零重叠），常规打分救不了，
+# 只能靠补位。
+_PREFERENCE_QUERY_RE = re.compile(
+    r"喜欢什么|讨厌|偏好|口味|推荐|建议|爱吃什么|爱喝什么|品味|爱好")
+
+
+def _preference_fill(mv: "MemoryVersion", out: list[MemoryItem],
+                     top_k: int) -> list[MemoryItem]:
+    """M-4 偏好兜底：偏好类查询没拿满 top_k 时，用偏好条目补位。
+
+    纯读、去重、**追加在常规命中之后**（不覆盖常规结果）；排序沿用
+    recency（新在前），与 M-3 一致。只认 category 含「偏好」的条目。
+    """
+    seen = {x.id for x in out}
+    prefs = [it for it in mv.items
+             if it.id not in seen and it.tier != TIER_ARCHIVE
+             and "偏好" in (it.category or "")]
+    if not prefs:
+        return out
+    prefs.sort(key=lambda it: (it.created_at or "", it.id), reverse=True)
+    out = list(out)
+    for it in prefs:
+        if len(out) >= max(0, top_k):
+            break
+        out.append(it)
+    return out
+
+
+# M-5：查询侧时间表达 → 时间窗。**只加权/降权，绝不过滤**——与 decay 的
+# 「未知时间不衰减」同一哲学：宁重勿丢。解析不了返回 None（不加权）。
+_TIME_WINDOW_RE = re.compile(
+    r"(今天|今日|昨天|前一天|本周|这一周|上周|最近|上个月|这个月|本月|去年|"
+    r"(\d{1,2})月(\d{1,2})?[日号]?|(\d+)天前|(?:最近|近)(\d+)天)")
+
+
+def _time_window(query: str, now):
+    """解析查询里的时间表达，返回 (start, end) 本地 naive datetime，或 None。"""
+    from datetime import datetime as _dt, timedelta as _td
+
+    if not query:
+        return None
+    now = now or _dt.now()
+    if now.tzinfo is not None:
+        now = now.astimezone().replace(tzinfo=None)
+    q = str(query)
+    # 「X月之前/以前」这类反向表达先识别出来直接放弃——加权方向会反，宁可不算
+    if re.search(r"[日号月天年]\s*(之前|以前)", q):
+        return None
+    m = re.search(r"(?:最近|近)(\d+)天", q)
+    if m:
+        return now - _td(days=max(1, int(m.group(1)))), now
+    if re.search(r"今天|今日", q):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0), now
+    if re.search(r"昨天|前一天", q):
+        e = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return e - _td(days=1), e
+    if re.search(r"本周|这一周", q):
+        e = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return e - _td(days=e.weekday()), now
+    if re.search(r"上周", q):
+        e = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (e - _td(days=e.weekday() + 7), e - _td(days=e.weekday()))
+    m = re.search(r"(\d+)天前", q)
+    if m:
+        n = max(1, int(m.group(1)))
+        return now - _td(days=n), now - _td(days=n - 1)
+    if re.search(r"上个月", q):
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        prev_last = first - _td(days=1)
+        return prev_last.replace(day=1), first
+    if re.search(r"这个月|本月", q):
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return first, now
+    m = re.search(r"(\d{1,2})月(?:([1-9]|[12]\d|3[01]))?[日号]?", q)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2)) if m.group(2) else None
+        year = now.year if (month < now.month
+                            or (month == now.month and (day or 32) <= now.day)) \
+            else now.year - 1
+        try:
+            if day:
+                start = _dt(year, month, day)
+                return start, min(start + _td(days=1), now)
+            start = _dt(year, month, 1)
+            end = _dt(year + (month == 12), (month % 12) + 1, 1)
+            return start, min(end, now)
+        except ValueError:
+            return None
+    if re.search(r"去年", q):
+        return _dt(now.year - 1, 1, 1), _dt(now.year - 1, 12, 31, 23, 59, 59)
+    if re.search(r"最近", q):
+        return now - _td(days=7), now
+    return None
+
+
+def _time_adjust(item: "MemoryItem", s: float, win) -> float:
+    """M-5：时间窗调整——窗内 +1.5、窗外 ×0.6、无时间戳不动（不伪造时间）。"""
+    if win is None or s <= 0:
+        return s
+    ts = _parse_ts(item.created_at)
+    if ts is None:
+        return s
+    if ts.tzinfo is not None:
+        ts = ts.astimezone().replace(tzinfo=None)
+    in_win = win[0] <= ts <= win[1]
+    return s + 1.5 if in_win else s * 0.6
+
+
+def _collapse_dupes(items: list["MemoryItem"]) -> list["MemoryItem"]:
+    """P2（找问题轮 2026-11-15）：近重复条目折叠——检索端去重。
+
+    实测病灶：v015-v019 整理造了近重复（熬夜×3 / 军训×2 / 茉莉花茶×2 /
+    专业×2），同文本同分 × M-3 recency 成串霸榜，再被 M-4 类别加权放大，
+    top-20 被重复内容淹没。这里按**词元集合包含度 ≥0.8** 折叠（保留排序
+    最前 = 最新/最相关的一份），只影响注入清单，不动记忆链（只追加原则）。
+    根治在 M-6 按条蒸馏的合并环节。
+    """
+    kept: list[MemoryItem] = []
+    kept_tokens: list[set] = []
+    for it in items:
+        tk = set(tokenize(it.text or ""))
+        dup = False
+        for k in kept_tokens:
+            if tk and k and len(tk & k) / max(1, min(len(tk), len(k))) >= 0.8:
+                dup = True
+                break
+        if not dup:
+            kept.append(it)
+            kept_tokens.append(tk)
+    return kept
+
+
 def retrieve(
     mv: MemoryVersion | None,
     query: str,
@@ -1099,11 +1362,16 @@ def retrieve(
     top_k: int = 5,
     layered: bool = True,
     recall_counts: dict[str, int] | None = None,
+    now=None,
 ) -> list[MemoryItem]:
     """从给定记忆版本里取 top-k 条目。
 
     返回空列表是**合法且重要**的结果：它表示「这一轮没检索到任何记忆」，
     必须原样落盘，否则日后无法区分漂移与检索失败。
+
+    `now`（2026-11-07，外部调研 #1）：透传给 importance 的时效衰减，
+    生产留空（用真实当下）；测试传确定时间以便复现排序。
+    `recall_counts` 的说明见 rank 内注释。
 
     ## 分层检索（Memory V1）
 
@@ -1135,24 +1403,52 @@ def retrieve(
 
     ident = _is_identity_query(query)
 
+    # M-4 门控（找问题轮修正）：只有查询本身是偏好类，偏好加权才允许生效。
+    pref_q = bool(_PREFERENCE_QUERY_RE.search(query))
+
+    # M-5：查询侧时间窗（只加权/降权，绝不过滤；解析失败=不加权）
+    from datetime import datetime as _dt_retr
+    _now_dt = now or _dt_retr.now()
+    if _now_dt.tzinfo is not None:
+        _now_dt = _now_dt.astimezone().replace(tzinfo=None)
+    _win = _time_window(query, _now_dt)
+
     def rank(items):
-        scored = [(it, _score(it, qt_expanded, identity_query=ident)) for it in items]
+        scored = [(it, _time_adjust(
+            it, _score(it, qt_expanded, identity_query=ident, pref_query=pref_q),
+            _win)) for it in items]
         scored = [(it, s) for it, s in scored if s > 0]
         # 相关度为主，重要性为微调（乘 0.3 权重，避免重要性压过相关性）。
-        # 分数相同按 id 升序 —— 完全确定，不依赖 dict/DB 顺序。
+        #
+        # M-3（记忆优化批 2026-11-14）：同分不再互挤 —— 相关度相同时**新条目靠前**
+        # （recency tie-break），多会话场景里「同主题同分」不再把新证据挤出 top_k。
+        # 旧版同分按 id 升序、与时间无关 → 同主题旧条目可能长期占位。
+        # 实现用两次稳定排序：先 (created_at, id) 升序再整体反转（新在前、id 兜底），
+        # 再按相关度**稳定**排序 —— 同分保持「新在前」，完全确定，不依赖 dict/DB 顺序。
+        # 无时间戳条目（历史数据 created_at=None）在同分组里排最后，不伪造时间。
         #
         # B3：`recall_counts` 是**派生**出来的真实召回次数（不写回条目）。
         # 它只经由 importance 起作用，且被上面的 0.3 压过 —— 不会抢戏。
-        def key(pair):
+        def primary_key(pair):
             it, s = pair
             rc = None if recall_counts is None else recall_counts.get(it.id)
-            return (-(s + 0.3 * importance(it, recall_count=rc)), it.id)
+            return -(s + 0.3 * importance(it, now=now, recall_count=rc))
 
-        scored.sort(key=key)
+        def recency_key(pair):
+            it, _ = pair
+            return (it.created_at or "", it.id)
+
+        scored.sort(key=recency_key, reverse=True)
+        scored.sort(key=primary_key)
         return scored
 
     if not layered:
-        return [it for it, _ in rank(mv.items)[: max(0, top_k)]]
+        out = [it for it, _ in rank(mv.items)[: max(0, top_k)]]
+        # M-4：偏好类查询补位（非偏好查询不做——乱补无关偏好条目是噪声）
+        if _PREFERENCE_QUERY_RE.search(query):
+            out = _preference_fill(mv, out, top_k)
+        # P2：近重复折叠（放在补位后、截断前——补进来的偏好条目同样去重）
+        return _collapse_dupes(out)[: max(0, top_k)]
 
     primary = [it for it in mv.items if it.tier != TIER_ARCHIVE]
     archived = [it for it in mv.items if it.tier == TIER_ARCHIVE]
@@ -1170,7 +1466,12 @@ def retrieve(
             out.append(it)
             seen.add(it.id)
 
-    return out[: max(0, top_k)]
+    # M-4：偏好类查询补位（分层的最后一站——core/experience/archive 都没拿满时）
+    if _PREFERENCE_QUERY_RE.search(query):
+        out = _preference_fill(mv, out, top_k)
+
+    # P2：近重复折叠后再截断——重复内容不再占据 top_k 名额
+    return _collapse_dupes(out)[: max(0, top_k)]
 
 
 def retrieve_scored(
@@ -1178,18 +1479,35 @@ def retrieve_scored(
     query: str,
     *,
     top_k: int = 5,
+    recall_counts: dict[str, int] | None = None,
+    now=None,
 ) -> list[tuple[MemoryItem, float]]:
-    """与 retrieve 相同，但把分数一并返回，便于核对「为什么排这个顺序」。"""
+    """与 retrieve 相同的打分口径，但把分数一并返回，便于核对「为什么排这个顺序」。
+
+    2026-11-07（外部调研 #1）：打分与 retrieve() 的 rank **对齐** ——
+    分数 = 相关性（n-gram 重叠）+ 0.3×重要性（importance 内含 decay 时效
+    与 recall_count 召回价值）。此前本函数**只算相关性**、也没有查询扩词，
+    与主路径 retrieve() 的排序口径不一致（双路径漂移）。
+    """
     if mv is None or not mv.items:
         return []
     qt = tokenize(query)
     if not qt:
         return []
+    qt_expanded = expand_query_tokens(qt)
+    if not qt_expanded:
+        qt_expanded = qt
     ident = _is_identity_query(query)
-    scored = [(it, _score(it, qt, identity_query=ident)) for it in mv.items]
-    scored = [(it, s) for it, s in scored if s > 0]
-    scored.sort(key=lambda pair: (-pair[1], pair[0].id))
-    return scored[: max(0, top_k)]
+    out = []
+    for it in mv.items:
+        s = _score(it, qt_expanded, identity_query=ident)
+        if s <= 0:
+            continue
+        rc = None if recall_counts is None else recall_counts.get(it.id)
+        total = s + 0.3 * importance(it, now=now, recall_count=rc)
+        out.append((it, total))
+    out.sort(key=lambda pair: (-pair[1], pair[0].id))
+    return out[: max(0, top_k)]
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1520,12 @@ def retrieve_scored(
 # 这里刻意**不新增配置项**，沿用本模块既有的「模块级常量」风格
 # （与 DECAY_HALF_LIFE_DAYS / CORE_MAX_ITEMS 一致）。
 INJECT_BUDGET_CHARS = 700     # 一次注入记忆的字符预算（含头尾说明）
-INJECT_SHORT_CHARS = 42       # 超预算时，后排条目降级成这么长的摘要
+INJECT_SHORT_CHARS = 80       # 超预算时，后排条目降级成这么长的摘要（M-2：42→80）
+# M-2（记忆优化批 2026-11-14）：预算与 top_k 联动。
+# 旧版固定 700 字配 top_k=5 尚可；top_k 提到 20 后，第 3 条起全部被压成
+# 42 字碎片 ——「召回了但看不见」等于没召回。每条给 160 字份额，
+# 预算 = max(700, 160×条数)；top_k 回调小时预算不虚增。
+INJECT_PER_ITEM_CHARS = 160
 
 
 def render_for_prompt(items: list[MemoryItem], *, budget_chars: int | None = None) -> str:
@@ -1222,7 +1545,9 @@ def render_for_prompt(items: list[MemoryItem], *, budget_chars: int | None = Non
     if not items:
         return ""
 
-    budget = INJECT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
+    # M-2：预算默认与条目数联动（显式传入 budget_chars 时以调用方为准）。
+    budget = (max(INJECT_BUDGET_CHARS, INJECT_PER_ITEM_CHARS * len(items))
+              if budget_chars is None else int(budget_chars))
     header = "【你记得的关于用户的事】"
     footer = "以上是长期记忆。若与本次对话冲突，以用户当前说法为准。"
 

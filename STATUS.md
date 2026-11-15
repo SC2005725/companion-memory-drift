@@ -1,6 +1,6 @@
 # 状态快照（**自动生成，勿手改**）
 
-生成时间：2026-10-25T18:41:27+08:00
+生成时间：2026-11-16T00:19:04+08:00
 
 > 本文件由 `python src\status_snapshot.py` **实跑生成**。
 > 会变的数字都集中在这里，其它文档只做定性描述并指向本文件 ——
@@ -13,19 +13,22 @@
 | 文件 | 覆盖 | 项数 | 结果 |
 |------|------|------|------|
 | `selftest.py` | Phase 1–3 端到端链路 | 13 | 全通过 |
-| `selftest_memory.py` | Phase 5 Memory + 身份检索 | 67 | 全通过 |
-| `selftest_companion.py` | Phase 6 关系 + 7 用户模型 + 8 心跳 + 身份捕获 | 120 | 全通过 |
+| `selftest_memory.py` | Phase 5 Memory + 身份检索 | 117 | 全通过 |
+| `selftest_companion.py` | Phase 6 关系 + 7 用户模型 + 8 心跳 + 身份捕获 | 149 | 全通过 |
 | `selftest_p0_capture.py` | P0 观测捕获 + 信息分类 + 证据语义 + 追溯性 | 85 | 全通过 |
 | `selftest_p2_conflict.py` | P2 矛盾保留 + 信念修正（方案 A）+ verifiable | 63 | 全通过 |
 | `selftest_tools.py` | Phase 9 工具层 | 78 | 全通过 |
 | `selftest_memory_source.py` | Memory 来源字段（缺失/空数组/去重） | 22 | 全通过 |
-| `selftest_merge.py` | Phase 11 合并式整理（旧记忆保护） | 33 | 全通过 |
-| `selftest_llm_exit.py` | Phase 11 统一 LLM 出口（doctor / webui 记账） | 32 | 全通过 |
+| `selftest_merge.py` | Phase 11 合并式整理（旧记忆保护） | 49 | 全通过 |
+| `selftest_llm_exit.py` | Phase 11 统一 LLM 出口（doctor / webui 记账） | 73 | 全通过 |
 | `selftest_router.py` | Phase 10 模型路由 | 30 | 全通过 |
-| `selftest_persona_state.py` | 人格状态 / 偏好演化 / 快照语义 | 46 | 全通过 |
+| `selftest_persona_state.py` | 人格状态 / 偏好演化 / 快照语义 | 51 | 全通过 |
+| `selftest_webui_security.py` | 网页界面访问控制（鉴权 / CSRF / XSS / 启动规则） | 42 | 全通过 |
 | `dryrun.py` | 全流程演练（在副本上跑） | 33 | 全通过 |
 
 全部离线、不联网、不花钱（用假客户端）。
+
+✅ **总体判定：13 个套件全部「全通过」。**
 
 ---
 
@@ -33,17 +36,31 @@
 
 | 表 | 含义 | 条数 |
 |----|------|------|
-| `conversations` | 对话轮数 | 325 |
-| `events` | 原始事件 | 19 |
-| `memory_versions` | 记忆版本 | 13 |
-| `retrievals` | 检索记录 | 328 |
-| `relationship_events` | 关系事件 | 10 |
-| `user_model_events` | 用户模型事件 | 11 |
-| `tool_calls` | 工具调用（含自测） | 56 |
-| `api_calls` | API 调用 | 364 |
-| `heartbeat_runs` | 心跳运行 | 13 |
-| `pending_actions` | 待处理意向（主动消息） | 1 |
-| `concern_injections` | 关注点留痕 P0（injected=1 才算真的进过上下文） | 1 |
+| `conversations` | 对话轮数 | 374 |
+| `events` | 原始事件 | 24 |
+| `memory_versions` | 记忆版本 | 20 |
+| `retrievals` | 检索记录 | 380 |
+| `relationship_events` | 关系事件 | 12 |
+| `user_model_events` | 用户模型事件 | 12 |
+| `tool_calls` | 工具调用（含自测） | 57 |
+| `api_calls` | API 调用 | 406 |
+| `heartbeat_runs` | 心跳运行 | 214 |
+| `pending_actions` | 待处理意向（主动消息） | 35 |
+| `concern_injections` | 关注点留痕 P0（injected=1 才算真的进过上下文） | 11 |
+
+> ✅ **副作用已修复（2026-10-26）**：本脚本会实跑 `src/selftest.py`，
+> 而它在 `--allow-real` 下会调 `chat.send_once()` → 进而调 `heartbeat.maybe_tick()`。
+> **修复前**这会在真实库里写入 `heartbeat_runs` 行，并可能写入 `pending_actions` 行。
+>
+> **修法**：`selftest.py` 在端到端跑之前把心跳切到 `dry_run=True`（只算不写）；
+> 判定与节流逻辑照常执行，但**不落盘**。实测：修复后连跑本脚本，
+> **8 张表计数 0 变化**。
+>
+> ⚠️ **但 2026-10-26 之前产生的历史污染仍在库里**（未清除，需另行授权）：
+> `heartbeat_runs` 里的 `hb_3b8ea1af43` 与 `pending_actions` 里的 `pa_3dec25ef38`
+> （均为 2026-10-26T13:06:41，`context.trigger=chat`）**不是真实用户可见的主动消息**。
+> **因此「真实主动消息发过几条」不能直接用 `pending_actions` 的计数** ——
+> 真实用户可见的只有 2026-10-25T16:36:32 那条 `pa_3c6935e11d`。
 
 > ⚠️ **另有一个冻结快照**：Phase 5 漂移实验结束时是 **67 轮对话 / 8 原始事件 / 3 记忆版本**。
 > 那个数字**不回填**，它是实验封版时的证据。引用时务必带时点。
@@ -52,8 +69,8 @@
 
 ## 工具调用（区分真实使用与自测）
 
-- **真实对话里的调用：21 次**（成功 15 / 被拒 3 / 报错 3）
-- 按工具：{'read_file': 16, 'take_note': 4, 'now': 1}
+- **真实对话里的调用：22 次**（成功 16 / 被拒 3 / 报错 3）
+- 按工具：{'read_file': 16, 'take_note': 5, 'now': 1}
 - 开发期自测调用：35 次（**不计入真实使用**）
 
 - **多步 Tool Loop（多轮迭代）：5 轮**，seq [120, 128, 129, 130, 134]
@@ -66,7 +83,7 @@
 
 ## 累计花费
 
-0.686600 元（364 次调用 / 640,456 tokens）
+0.894133 元（425 次调用 / 832,957 tokens）
 
 > 口径：`logs/ledger.jsonl` 里所有调用的估算费用之和。
 > ⚠️ 若与别的项目**共用同一个 API Key**，不能用账户余额反推本项目花费。
@@ -80,7 +97,7 @@
 | **情绪持久化** | `emotion/` 文件数 | **0** | 某次整理后 `emotion/` **自己**出现文件，且 residue 里 `event_refs` 对得上真实发生过的事 |
 | **人格发展闭环** | `profile.json` 有 `provisional` | **无** | `profile.json` 自己出现 `provisional`，且 `challenged` 是用户说过的话 |
 | **模型适配层** | 源码里的 `MODEL_ADAPTER` | **未启用** | 实际接管过一次调用 |
-| **图片多模态** | `uploads/` 文件数 | **1** | 真实对话里用过并正确识别 |
+| **图片多模态** | `uploads/` 文件数 | **2** | 真实对话里用过并正确识别 |
 
 > ⚠️ **本表只回答「有没有」。** 按底层设定：**「没有触发」是可观察事实**，
 > **「因此链路坏了」是需要额外证据的判断** —— 两者不可混为一谈。
@@ -102,6 +119,19 @@
 | 10 | Model Router | ⚠️ **完成了，但省不到钱**（见下） |
 | 11 | 长期运行实验 | ⚠️ **做不到无人值守长期运行**（见下） |
 | 12 | 商业化 / 开源发布 | ❌ 未开始，未写任何代码 |
+| 13 | 持续关注点 + 心跳接入 | ⚠️ **未完成阶段验收**（见下方逐档） |
+
+**Phase 13 逐档核实**（四档不可混同）：
+
+| 档 | 结论 | 依据 |
+|----|------|------|
+| 代码已存在 | ✅ 是 | `chat.py:546/866` · `memory.py:795/844` · `persona.py:235` |
+| 已接入聊天路径 | ✅ 是 | `pick_concerns` 定义于 `memory.py`，生产调用点 `chat.py:583` |
+| 有真实运行触发证据 | ⚠️ 仅 1 次 | `concern_injections` 表见上方计数（首条 2026-10-25 16:55:36） |
+| 有专门测试覆盖 | ❌ 无 | `concern` / `pick_concerns` 在 11 个 selftest + dryrun 中 0 命中 |
+| 已完成阶段验收 | ❌ 否 | 验收条件尚未定义 |
+
+> **不得因为存在一次触发记录就标记 Phase 13 已完成。**
 
 **另有一项不在原规范内**：本地网页界面（`python src\main.py ui`）。
 规范的 12 个 Phase 里没有任何一期是界面，它是为「看得懂」额外加的。
@@ -109,7 +139,7 @@
 Phase 10 如实说明 —— **这一期没有产生成本收益**：
 
 ```
-所有 364 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）
+所有 406 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）
 → 「简单任务用便宜模型」没有更便宜的可用 → 省 0 元
 → 若把复杂任务送去 deepseek-v4-pro，反而贵 4.5 倍
 ```

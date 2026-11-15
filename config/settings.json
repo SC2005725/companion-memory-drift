@@ -13,7 +13,8 @@
   },
   "memory": {
     "_comment": "Phase 5 记忆检索参数。检索方式刻意只用关键词 + 2-gram，不引入 embedding 与向量库 —— 见 src/memory.py 顶部说明。",
-    "top_k": 5,
+    "_top_k_note": "M-1（记忆优化批 2026-11-14）：5→20。LongMemEval 离线实验 limit 20 折算 70.4%→85.3%（多会话部分召回是最大失分源）；前提是注入预算与 top_k 联动（memory.py INJECT_PER_ITEM_CHARS），否则后排条目会被压成碎片。",
+    "top_k": 20,
     "auto_consolidate": {
       "_comment": "Memory V1 自动整理。**批量触发**而非每轮：整理要一次模型调用（约 0.03 元），每轮都做会让闲聊成本翻很多倍。",
       "enabled": true,
@@ -283,6 +284,13 @@
         "input": 9.0,
         "output": 27.0
       }
+    },
+    "budget": {
+      "_comment": "F-3 预算闸门 v1（费用可信度批 2026-11-14）。monthly_yuan = 每月估算费用上限（元），0 = 关闭（默认关，老板定一个数即生效）；soft_ratio = 到达上限多少比例时开始告警（放行但记日志）；exempt_purposes = 过硬线仍放行的用途 —— chat（用户主动对话）默认豁免，钱可以省、人不能不理。",
+      "_enforce_point": "在统一出口 chat.call_model 前置检查，本月花费按 api_calls 表 UTC 自然月 SUM(cost_micro_yuan) 统计；硬线拦截是非必要用途（consolidate/probe/doctor 等）直接不发请求，BudgetExceeded 继承 LLMError，调用方既有兜底不变。",
+      "monthly_yuan": 30,
+      "soft_ratio": 0.8,
+      "exempt_purposes": ["chat"]
     }
   },
   "raw_event_triggers": {
@@ -328,7 +336,7 @@
   },
   "heartbeat": {
     "_comment": "Phase 8 心跳规则。总项目指令 §8/§9/§29：Heartbeat 只提供「时间流逝」和「检查机会」，真正的主动性来自当前状态；且『选择不行动本身也是 Agency』。所以这里全是确定性规则，且默认结论就是不行动。",
-    "_no_push_warning": "本项目是命令行聊天，没有投递通道，无法主动推送消息。所以 proactive_message 只是「意图」，落进 pending_actions，等下次用户开口时注入 —— 不假装能主动发消息。",
+    "_no_push_warning": "投递通道：ntfy 手机推送已接入（heartbeat.deliver_to_ntfy），但【默认关闭】—— 只有配置了环境变量 NTFY_TOPIC 才会投递。未配置时行为与旧版完全一致：proactive_message 只是「意图」，落进 pending_actions，等下次用户开口时注入。注意：投递成功只代表 ntfy.sh 收下了，不代表手机收到 —— 「真的弹出」只能由人确认，代码无法自证。",
     "idle_hours_for_proactive": 12,
     "_idle_meaning": "距上次对话超过这么多小时，才考虑主动。",
     "quiet_hours": [

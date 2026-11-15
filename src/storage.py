@@ -63,7 +63,17 @@ CREATE TABLE IF NOT EXISTS api_calls (
     cache_hit_tokens   INTEGER NOT NULL DEFAULT 0,
     peak               INTEGER NOT NULL DEFAULT 0,
     cost_micro_yuan    INTEGER,
-    latency_ms         INTEGER
+    latency_ms         INTEGER,
+    error              TEXT
+);
+
+-- 小型运行状态 kv（费用可信度批 F-2/F-3，2026-11-14）：
+-- 整理失败退避计数、预算软线月度提醒标记等。只放**可重建的运行状态**，
+-- 不放任何实验数据 —— 对话/记忆版本/事件各有自己的表，不许混用。
+CREATE TABLE IF NOT EXISTS kv_state (
+    key             TEXT PRIMARY KEY,
+    value           TEXT,
+    updated_at_utc  TEXT NOT NULL
 );
 
 -- Phase 5：记忆版本登记。文件本体在 memory/versions/vNNN.json，这里只是索引。
@@ -194,7 +204,8 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     reason          TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     delivered_at    TEXT,
-    turn_id         TEXT
+    turn_id         TEXT,
+    deliver_at      TEXT
 );
 
 -- Phase 9：工具调用账本。
@@ -295,9 +306,37 @@ def connect(*, for_test: bool = False) -> sqlite3.Connection:
             )
     conn = sqlite3.connect(str(DB_FILE))
     conn.row_factory = sqlite3.Row
+    _conn_guard(conn)
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
     return conn
+
+
+def _conn_guard(conn: sqlite3.Connection) -> None:
+    """每个连接统一开的写护栏（雷 8，2026-11-07 深度审查 · 实测锁 5.5s）。
+
+    主程序 / 心跳 worker / webui 三个进程都会写 conversations.db，
+    默认 journal 模式下写锁互斥：撞上就立刻抛 "database is locked"，
+    用户消息丢、而 LLM 已计费。三件套：
+
+      ① `journal_mode=WAL` —— 读写不互斥（读走快照），写冲突从
+         「整库锁 5.5s」降到毫秒级；掉电后靠 -wal 文件恢复，不损坏库。
+      ② `busy_timeout=5000` —— 写锁被占先等 5 秒而不是立刻炸。
+      ③ `synchronous=NORMAL` —— WAL 官方推荐档：比 FULL 快得多，
+         最坏情况（掉电）只丢最后几个事务，库本身不坏。
+
+    WAL 在个别介质上（网络盘、老的 SMB 挂载）开不起来 —— 那就保持
+    默认模式，**护栏开不起来不构成拒连理由**，绝不让兜底变成新的故障点。
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        pass
 
 
 def redirect_db(path) -> None:
@@ -332,6 +371,17 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             # 结构变更，不动原始数据内容。早期版本建的库会缺这两列。
             "content_hash": "TEXT NOT NULL DEFAULT ''",
             "prev_content_hash": "TEXT",
+        },
+        "pending_actions": {
+            # 2026-11-07（外部调研 #7）：定时承诺的到点时间。
+            # kind=scheduled_reminder 的条目到 deliver_at 后由心跳兑现。
+            "deliver_at": "TEXT",
+        },
+        "api_calls": {
+            # 费用可信度批 F-1（2026-11-14）：失败调用的兜底入账。
+            # 失败也可能真实扣费（如「思考吃满预算→重试仍空」抛错的那两次），
+            # 记账不再以 send() 成功为前提；error 列存失败原因摘要。
+            "error": "TEXT",
         },
     }
     for table, columns in wanted.items():
@@ -569,22 +619,49 @@ def record_api_call(
     peak: bool,
     cost_micro_yuan: int | None,
     latency_ms: int,
+    error: str | None = None,
 ) -> None:
     created_utc, _ = _now()
     conn.execute(
         """
         INSERT INTO api_calls (
             call_id, created_at_utc, session_id, turn_id, model, prompt_tokens,
-            completion_tokens, cache_hit_tokens, peak, cost_micro_yuan, latency_ms
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            completion_tokens, cache_hit_tokens, peak, cost_micro_yuan, latency_ms, error
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             call_id, created_utc, session_id, turn_id, model, prompt_tokens,
             completion_tokens, cache_hit_tokens, 1 if peak else 0,
-            cost_micro_yuan, latency_ms,
+            cost_micro_yuan, latency_ms, error,
         ),
     )
     conn.commit()
+
+
+def get_kv(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    """读 kv_state（费用批 F-2/F-3）。库不可用/无表时返回 default，不抛。"""
+    try:
+        row = conn.execute("SELECT value FROM kv_state WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return default
+    return row["value"] if row else default
+
+
+def set_kv(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """写 kv_state（UPSERT）。库不可用时静默跳过 —— 状态丢失不构成新故障点。"""
+    created_utc, _ = _now()
+    try:
+        conn.execute(
+            """
+            INSERT INTO kv_state (key, value, updated_at_utc) VALUES (?,?,?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value, updated_at_utc=excluded.updated_at_utc
+            """,
+            (key, str(value), created_utc),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        pass
 
 
 def stats(conn: sqlite3.Connection) -> dict:
@@ -640,14 +717,18 @@ def record_memory_version(
 
 
 def list_memory_versions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    # P1（v1000 数值排序）：version 是 "v004" 这类文本，字典序 v999 > v1000。
+    # 按去掉 v 前缀后的数值排，千位版本不再被百位压住。
     return conn.execute(
-        "SELECT * FROM memory_versions ORDER BY version ASC"
+        "SELECT * FROM memory_versions "
+        "ORDER BY CAST(SUBSTR(version, 2) AS INTEGER) ASC"
     ).fetchall()
 
 
 def latest_memory_version(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT * FROM memory_versions ORDER BY version DESC LIMIT 1"
+        "SELECT * FROM memory_versions "
+        "ORDER BY CAST(SUBSTR(version, 2) AS INTEGER) DESC LIMIT 1"
     ).fetchone()
 
 
@@ -937,6 +1018,27 @@ def list_heartbeat_runs(conn: sqlite3.Connection, limit: int | None = None) -> l
     return conn.execute(sql).fetchall()
 
 
+def _parse_iso_utc(value) -> "datetime | None":
+    """容忍解析 ISO8601 → aware UTC（P1：deliver_at 解析后比较的前置件）。
+
+    P1 清单第 4 条的病根：SQL 里对 ISO 字符串直接 `<=` 比较，"+08:00" 格式
+    与 UTC 格式字典序错乱（+0b… < +08… 之外，日期部分语义也不可比）。
+    解析不了的返回 None，调用方 fail closed。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)  # 朴素时间按 UTC（本字段的历史口径）
+    return dt.astimezone(timezone.utc)
+
+
 def record_pending_action(
     conn: sqlite3.Connection,
     *,
@@ -944,19 +1046,52 @@ def record_pending_action(
     kind: str,
     message: str,
     reason: str,
+    deliver_at: str | None = None,
 ) -> str:
+    """落一条主动意图。`deliver_at`（2026-11-07，外部调研 #7）：
+    kind=scheduled_reminder 时的到点时间（UTC ISO）——心跳到点兑现，不经过 decide()。
+
+    P1（deliver_at 解析后比较）：入库存前统一归一成 UTC ISO——调用方传
+    "+08:00" 之类的本地时间也存成 UTC，读侧比较不再依赖写侧格式自觉。"""
+    if deliver_at:
+        _d = _parse_iso_utc(deliver_at)
+        if _d is not None:
+            deliver_at = _d.isoformat()
     pending_id = f"pa_{uuid.uuid4().hex[:10]}"
     created_utc, created_local = _now()
     conn.execute(
         """
         INSERT INTO pending_actions (
-            pending_id, created_at_utc, created_at_local, run_id, kind, message, reason, status
-        ) VALUES (?,?,?,?,?,?,?,'pending')
+            pending_id, created_at_utc, created_at_local, run_id, kind, message, reason, status,
+            deliver_at
+        ) VALUES (?,?,?,?,?,?,?,'pending',?)
         """,
-        (pending_id, created_utc, created_local, run_id, kind, message, reason),
+        (pending_id, created_utc, created_local, run_id, kind, message, reason, deliver_at),
     )
     conn.commit()
     return pending_id
+
+
+def list_due_reminders(conn: sqlite3.Connection, now_utc: str) -> list[sqlite3.Row]:
+    """到点的定时承诺（2026-11-07，外部调研 #7）：
+    kind=scheduled_reminder、deliver_at 已到、尚未兑现（status=pending）。
+
+    P1（deliver_at 解析后比较）：不再用 SQL 字符串比较——存量库里两种格式
+    并存（"+08:00" 的会被字典序判成永远未到点，迟送 6.5h+）。改为取出全部
+    未兑现定时承诺后在 Python 侧解析比较；解析不了的跳过（fail closed，
+    宁可不送，不误判到点）。"""
+    rows = conn.execute(
+        "SELECT * FROM pending_actions "
+        "WHERE status='pending' AND kind='scheduled_reminder' "
+        "AND deliver_at IS NOT NULL").fetchall()
+    now_dt = _parse_iso_utc(now_utc) or datetime.now(timezone.utc)
+    due = []
+    for r in rows:
+        d = _parse_iso_utc(r["deliver_at"])
+        if d is not None and d <= now_dt:
+            due.append(r)
+    due.sort(key=lambda r: _parse_iso_utc(r["deliver_at"]))
+    return due
 
 
 def list_pending_actions(conn: sqlite3.Connection, status: str | None = "pending") -> list[sqlite3.Row]:
@@ -970,6 +1105,39 @@ def list_pending_actions(conn: sqlite3.Connection, status: str | None = "pending
     ).fetchall()
 
 
+def list_pending_for_chat(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """chat 链路专用的待处理清单（2026-11-07，雷 2/3 修复）。
+
+    proactive 意图全含；scheduled_reminder **仅在 deliver_at 已到时**才含——
+    未到点的提醒提前注入并标 delivered，会让提醒到点永不兑现
+    （雷 2/3：digest 与 chat 两条路径都需要此过滤，工单二云端的兜底同理）。"""
+    now_utc, _ = _now()
+    return conn.execute(
+        "SELECT * FROM pending_actions WHERE status='pending' AND "
+        "(kind != 'scheduled_reminder' OR (deliver_at IS NOT NULL AND deliver_at <= ?)) "
+        "ORDER BY created_at_utc ASC, rowid ASC",
+        (now_utc,),
+    ).fetchall()
+
+
+def list_pending_reminders_window(conn: sqlite3.Connection, *, cutoff: str) -> list[sqlite3.Row]:
+    """未兑现的定时承诺（2026-11-07，云端工单二：断机期兜底的本地半边）。
+
+    kind=scheduled_reminder、status=pending、deliver_at <= cutoff（默认 now+48h）。
+    心跳每次 tick 把这个清单写成根目录 reminders.json 供云端 cron 兜底读取。"""
+    from datetime import timedelta
+
+    horizon = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+    cut = cutoff or horizon
+    return conn.execute(
+        "SELECT * FROM pending_actions "
+        "WHERE status='pending' AND kind='scheduled_reminder' "
+        "AND deliver_at IS NOT NULL AND deliver_at <= ? "
+        "ORDER BY deliver_at ASC",
+        (cut,),
+    ).fetchall()
+
+
 def mark_pending_delivered(conn: sqlite3.Connection, pending_id: str, turn_id: str) -> None:
     """标记某条待处理项已在某一轮兑现。不删除 —— 保留投递痕迹。"""
     created_utc, _ = _now()
@@ -977,6 +1145,33 @@ def mark_pending_delivered(conn: sqlite3.Connection, pending_id: str, turn_id: s
         "UPDATE pending_actions SET status='delivered', delivered_at=?, turn_id=? "
         "WHERE pending_id=?",
         (created_utc, turn_id, pending_id),
+    )
+    conn.commit()
+
+
+def mark_pending_pushed(conn: sqlite3.Connection, pending_id: str) -> None:
+    """标记某条待处理项**已经推到手机**了（2026-11-04 加的）。
+
+    为什么需要它：`pending_actions` 原先只有两种状态 —— `pending`（还没说）
+    和 `delivered`（在你开口那一轮注入了）。而 `maybe_tick` 见到任何
+    `pending` 就不生成新的（防刷屏），划掉的动作**只发生在你开口时**。
+
+    后果：定时心跳跑起来以后，第一次说了一句、推到了手机，这条记录仍然是
+    `pending`；只要你不开口，之后每一次定时心跳都会判定「已有待处理项」并
+    直接退出。**结果是「主动」最多只响一次，然后永久沉默。**
+
+    所以这里多一个状态 `pushed`：话已经送到你手机上了，就不再算「欠着没说」，
+    后面该生成新的就生成新的。
+
+    与 `delivered` 的区别：
+      - `delivered` = 在你那一轮对话里注入了，`turn_id` 有值
+      - `pushed`    = 只是推到了手机，没有对应的对话轮次，`turn_id` 保持空
+    """
+    created_utc, _ = _now()
+    conn.execute(
+        "UPDATE pending_actions SET status='pushed', delivered_at=? "
+        "WHERE pending_id=? AND status='pending'",
+        (created_utc, pending_id),
     )
     conn.commit()
 

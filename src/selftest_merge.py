@@ -75,7 +75,8 @@ for m in ("storage", "pricing", "memory", "changelog", "retrieve", "consolidate"
 
 import memory as memory_mod  # noqa: E402
 from consolidate import (  # noqa: E402
-    ConsolidateError, build_user_message, merge_items, parse_items,
+    ConsolidateError, build_user_message, build_user_message_ex, merge_items,
+    parse_items, resolve_cursor,
 )
 
 CHECKS: list[tuple[str, bool, str]] = []
@@ -216,6 +217,65 @@ def main() -> int:
     check("含 deletes 说明", "deletes" in msg)
     msg0 = build_user_message([], [], None)
     check("无旧条目时不列该段", "第一版" in msg0, "")
+
+    # ---------------- P9 雷1 回归：截断保尾弃头 + 游标安全水位 ----------------
+    # 旧版 text[:MAX] 保头弃尾，砍掉的正是本轮新对话，而游标照样推进 → 静默永久丢。
+    # 新版：事件/旧记忆先弃（有底，下轮重带），对话保尾弃头，游标回退宁重勿丢。
+    print("\n[P9] 雷1 回归：截断保尾弃头，游标只记真正进 prompt 的 seq")
+    import consolidate as _cons
+    _max_backup = _cons.MAX_CONVERSATION_CHARS
+    try:
+        _cons.MAX_CONVERSATION_CHARS = 3000
+
+        big_turns = [
+            {"seq": s, "at": f"2026-11-07 10:{s:02d}", "user": f"第{s}轮的问题" * 30,
+             "assistant": f"第{s}轮的回答" * 30}
+            for s in range(1, 201)
+        ]
+        text1, meta1 = build_user_message_ex([], big_turns, None)
+        check("触发截断", meta1["truncated"] is True, str(meta1["truncated"]))
+        check("最新轮在（保尾）", "#200 用户：" in text1, "")
+        check("最老轮不在（弃头）", "第1轮的问题" not in text1, "")
+        k = meta1["turns_kept_from_seq"]
+        check("审计记下首条进 prompt 的 seq", k is not None and 1 < k <= 200, str(k))
+        check("进 prompt 的轮数对账", meta1["turns_in_prompt"] == 200 - k + 1,
+              f"{meta1['turns_in_prompt']} vs {200 - k + 1}")
+        check("游标回退到首条进 prompt 的前一轮", resolve_cursor(meta1, 200) == k - 1,
+              str(resolve_cursor(meta1, 200)))
+        check("无超限放行", meta1["oversize_allowed"] is False, str(meta1["oversize_allowed"]))
+        check("截断有显式告知（模型不知情会误判无信息）", "仅保留" in text1, "")
+
+        # 事件全量膨胀是常态触发源：先牺牲事件（DB 有底），对话轮不动
+        big_events = [
+            {"event_id": f"e{s:03d}", "at": f"2026-11-07 {s % 24:02d}:00",
+             "text": "事件正文" * 50}
+            for s in range(1, 51)
+        ]
+        small_turns = [
+            {"seq": 1, "at": "t", "user": "新对话一", "assistant": "回答一"},
+            {"seq": 2, "at": "t", "user": "新对话二", "assistant": "回答二"},
+        ]
+        text2, meta2 = build_user_message_ex(big_events, small_turns, None)
+        check("事件被截、对话没被截",
+              meta2["events_kept"] < meta2["events_total"]
+              and meta2["turns_kept_from_seq"] is None,
+              f"ev {meta2['events_kept']}/{meta2['events_total']}")
+        check("最新事件在（保尾）", "e050" in text2, "")
+        check("两轮对话都在", "新对话一" in text2 and "新对话二" in text2, "")
+
+        # 单轮就超限：放行超限，绝不截半轮（半轮会造成 seq 记账与实际不符）
+        huge = [{"seq": 9, "at": "t", "user": "超长粘贴" * 800, "assistant": "答"}]
+        text3, meta3 = build_user_message_ex([], huge, None)
+        check("单轮超限整轮保留", "超长粘贴" in text3, "")
+        check("标记 oversize_allowed", meta3["oversize_allowed"] is True,
+              str(meta3["oversize_allowed"]))
+        check("游标照常推进", resolve_cursor(meta3, 9) == 9, str(resolve_cursor(meta3, 9)))
+
+        # resolve_cursor 纯函数边界
+        check("游标：未截断 → 最后一轮", resolve_cursor({"turns_kept_from_seq": None}, 42) == 42, "")
+        check("游标：空 meta → 透传", resolve_cursor({}, None) is None, "")
+    finally:
+        _cons.MAX_CONVERSATION_CHARS = _max_backup
 
     # ---------------- M14 保留条目版本标记 ----------------
     print("\n[M14] 保留的旧条目不改写 first_seen_version")

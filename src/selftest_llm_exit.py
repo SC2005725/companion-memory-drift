@@ -64,6 +64,9 @@ from config import load_settings  # noqa: E402
 from llm import LLMError, Reply, Usage  # noqa: E402
 
 CHECKS: list[tuple[str, bool, str]] = []
+# 预算告警的 ntfy 投递在自测里全程被替换成捕获列表（见 main() 开头）——
+# 既断言「拦截真的会推手机」，又保证自测永远不发真实推送。
+NTFY_PUSHES: list[str] = []
 
 
 def check(name: str, good: bool, detail: str = "") -> None:
@@ -136,6 +139,15 @@ def main() -> int:
     setup_files()
     settings = load_settings()
     conn = storage.connect()
+
+    # ntfy 隔离：topic 换成假值 + 投递换成捕获列表。
+    # ⚠️ 必须在 load_settings() 之后立刻做 —— load_settings 会把真实 .env
+    # 的 NTFY_TOPIC 读进进程环境（config.py），不隔离的话预算告警会真推手机。
+    import heartbeat as _hb0
+    import os as _os0
+
+    _os0.environ["NTFY_TOPIC"] = "selftest-isolated-topic"
+    _hb0.deliver_to_ntfy = lambda topic, msg: NTFY_PUSHES.append(topic) or True
 
     # --- 隔离自检（防退化）-------------------------------------------------
     check("账本已隔离到临时目录", Path(pricing.LEDGER_FILE) != REAL_LEDGER,
@@ -342,6 +354,219 @@ def main() -> int:
     # 同样不断言返回值（隔离目录缺基线数据，见 T6 说明）
     check("doctor（无 --online）根本没做联机检查",
           "联机调用模型" not in off_out, "离线模式竟然走了联机分支")
+
+    # ======================================================================
+    print("\n[F1] ★费用可信度批：用量跨 attempt 合并（不再只记最后一次）")
+    import llm as llm_mod
+    from types import SimpleNamespace as _NS
+
+    def _fake_resp(content, finish, pt, ct):
+        msg = _NS(content=content)
+        ch = _NS(message=msg, finish_reason=finish)
+        # to_dict 让 _as_dict 能取到 raw（真 SDK 对象都有 model_dump/to_dict）
+        usage = _NS(prompt_tokens=pt, completion_tokens=ct, prompt_cache_hit_tokens=5,
+                    to_dict=lambda: {"prompt_tokens": pt, "completion_tokens": ct,
+                                     "prompt_cache_hit_tokens": 5})
+        return _NS(choices=[ch], usage=usage)
+
+    class _RetryClient(llm_mod.LLMClient):
+        """第一次请求：思考吃满预算（800 全是 reasoning、无内容）；
+        第二次（大预算）：正常回复。模拟真实「截断→重试」场景。"""
+
+        def __init__(self):
+            self.model = "deepseek-flash"
+            self.max_tokens = 800
+            self.empty_retry_max_tokens = 3200
+            self.empty_retries = 0
+            self.calls: list[int] = []
+
+        def _raw_send(self, messages, max_tokens, model=None):
+            self.calls.append(max_tokens)
+            if max_tokens == 800:
+                return _fake_resp("", "length", 100, 800)
+            return _fake_resp("在的", "stop", 100, 1000)
+
+    rc = _RetryClient()
+    reply = rc.send(MINIMAL)
+    check("attempt 数 = 2", reply.attempts == 2, f"{reply.attempts}")
+    check("prompt_tokens = 两次相加（200）",
+          reply.usage.prompt_tokens == 200, f"{reply.usage.prompt_tokens}")
+    check("completion_tokens = 两次相加（1800）",
+          reply.usage.completion_tokens == 1800, f"{reply.usage.completion_tokens}")
+    check("cache_hit = 两次相加（10）",
+          reply.usage.cache_hit_tokens == 10, f"{reply.usage.cache_hit_tokens}")
+    check("首次用量存档在 raw.first_attempt_usage",
+          "first_attempt_usage" in (reply.usage.raw or {}), "")
+
+    u1 = Usage(prompt_tokens=10, completion_tokens=800, cache_hit_tokens=5,
+               raw={"completion_tokens_details": {"reasoning_tokens": 800}})
+    u2 = Usage(prompt_tokens=10, completion_tokens=1000, cache_hit_tokens=5,
+               raw={"completion_tokens_details": {"reasoning_tokens": 500}})
+    merged = llm_mod._merge_usage(u1, u2)
+    check("合并后思考 token 相加（1300，记账口径不破）",
+          merged.raw["completion_tokens_details"]["reasoning_tokens"] == 1300,
+          str(merged.raw.get("completion_tokens_details")))
+
+    # ======================================================================
+    print("\n[F1b] ★重试抛错也带上已耗用量（服务端已计费的那几次）")
+    from llm import LLMError as _LE
+
+    class _FailOnRetryClient(_RetryClient):
+        def _raw_send(self, messages, max_tokens, model=None):
+            if max_tokens == 800:
+                return _fake_resp("", "length", 100, 800)
+            raise _LE("重试仍空（测试用）")
+
+    fr = _FailOnRetryClient()
+    try:
+        fr.send(MINIMAL)
+        check("抛出了 LLMError", False, "没有抛错")
+    except _LE as exc:
+        check("异常携带累计 usage（第一次的 100+800）",
+              exc.usage is not None and exc.usage.prompt_tokens == 100
+              and exc.usage.completion_tokens == 800,
+              f"usage={exc.usage}")
+        check("异常携带 attempt 数", exc.attempts == 1, f"{exc.attempts}")
+
+    # ======================================================================
+    print("\n[F1c] ★call_model 失败兜底入账（api_calls + ledger 都有，error 可见）")
+    class _FailWithUsage:
+        model = "deepseek-flash"
+
+        def send(self, messages, model=None):
+            raise _LE("重试仍空（测试用）",
+                      usage=Usage(prompt_tokens=100, completion_tokens=1800,
+                                  cache_hit_tokens=5),
+                      attempts=2)
+
+    before_calls = api_call_count(conn)
+    lb = ledger_lines()
+    try:
+        chat.call_model_standalone(_FailWithUsage(), MINIMAL, settings=settings,
+                                   conn=conn, purpose="doctor")
+        check("异常原样上抛", False, "没有抛错")
+    except _LE as exc:
+        check("异常原样上抛（记账后不吞）", "重试仍空" in str(exc), "")
+    row = conn.execute(
+        "SELECT * FROM api_calls ORDER BY rowid DESC LIMIT 1").fetchone()
+    check("失败调用进了 api_calls", api_call_count(conn) == before_calls + 1, "")
+    check("error 列记录了失败原因", (row["error"] or "").find("重试仍空") >= 0,
+          str(row["error"])[:60])
+    check("失败调用的 token 也如实入账",
+          row["prompt_tokens"] == 100 and row["completion_tokens"] == 1800,
+          f"{row['prompt_tokens']}+{row['completion_tokens']}")
+    rec = json.loads(Path(pricing.LEDGER_FILE).read_text(
+        encoding="utf-8").splitlines()[-1])
+    check("账本行标记 ok=False", rec.get("ok") is False, str(rec.get("ok")))
+    check("账本行 attempts=2", rec.get("attempts") == 2, str(rec.get("attempts")))
+    check("失败费用按已耗 token 估算（>0）",
+          (rec.get("cost_micro_yuan") or 0) > 0, str(rec.get("cost_micro_yuan")))
+
+    # ======================================================================
+    print("\n[F2] ★整理失败退避：门槛函数 + kv_state 状态")
+    check("失败 1 次 → every+5", chat.backoff_threshold(20, 1) == 25,
+          str(chat.backoff_threshold(20, 1)))
+    check("失败 2 次 → every+10", chat.backoff_threshold(20, 2) == 30, "")
+    check("失败 7 次 → 封顶 every+240", chat.backoff_threshold(20, 7) == 260,
+          str(chat.backoff_threshold(20, 7)))
+    check("无失败 → 不加码", chat.backoff_threshold(20, 0) == 20, "")
+    storage.set_kv(conn, "consolidate_fail_count", 3)
+    check("kv_state 写读一致",
+          storage.get_kv(conn, "consolidate_fail_count") == "3", "")
+    check("kv_state 缺键返回默认", storage.get_kv(conn, "no-such-key", "d") == "d", "")
+
+    # ======================================================================
+    print("\n[F3] ★预算闸门：裁决函数 + 统一出口拦截")
+    cfg = {"monthly_yuan": 50, "soft_ratio": 0.8, "exempt_purposes": ["chat"]}
+    v, info = chat.budget_verdict(10_000_000, cfg, "chat")           # 10 元
+    check("软线以下放行", v == "ok", v)
+    v, _ = chat.budget_verdict(45_000_000, cfg, "consolidate")       # 45 元
+    check("过软线 → soft（放行+提醒）", v == "soft", v)
+    v, _ = chat.budget_verdict(50_000_001, cfg, "consolidate")       # 50.000001 元
+    check("过硬线非豁免 → block", v == "block", v)
+    v, _ = chat.budget_verdict(50_000_001, cfg, "chat")
+    check("过硬线但 chat 豁免 → hard_exempt", v == "hard_exempt", v)
+    check("未配置（0）→ off", chat.budget_verdict(999_999_999, {}, "probe")[0] == "off", "")
+    check("坏配置不炸（当 0 关闭）",
+          chat.budget_verdict(1, {"monthly_yuan": "abc"}, "probe")[0] == "off", "")
+
+    # 接线：把月预算设到极小（当前库已有花销必然超硬线）→ 非豁免用途发不出请求
+    import model_router as _MR
+    gb_client = FakeClient()
+    orig_budget = settings.cost.get("budget")
+    settings.cost["budget"] = {"monthly_yuan": 0.000001, "soft_ratio": 0.5,
+                               "exempt_purposes": ["chat"]}
+    try:
+        gb_session = chat.new_session(persona=None, settings=settings, client=gb_client,
+                                      peak_override=None, conn=conn, tools=None,
+                                      router=_MR.ModelRouter({"enabled": False},
+                                                             fallback=gb_client.model))
+        before_calls = api_call_count(conn)
+        _push_before = len(NTFY_PUSHES)
+        try:
+            chat.call_model(gb_session, MINIMAL, purpose="probe")
+            check("过硬线非豁免用途被拦", False, "没有拦")
+        except chat.BudgetExceeded as exc:
+            check("过硬线非豁免用途被拦（BudgetExceeded）", "预算已用尽" in str(exc), "")
+        check("被拦的调用没有发出请求", gb_client.seen == [], f"seen={gb_client.seen}")
+        check("被拦的调用没有产生费用记录", api_call_count(conn) == before_calls, "")
+        check("硬线拦截推了一条 ntfy（手机可见）",
+              len(NTFY_PUSHES) == _push_before + 1, f"pushes={len(NTFY_PUSHES)}")
+        chat.call_model(gb_session, MINIMAL, purpose="chat")
+        check("chat 豁免：过硬线仍放行", gb_client.seen != [], f"seen={gb_client.seen}")
+        check("chat 豁免也推了一条提醒", len(NTFY_PUSHES) == _push_before + 2,
+              f"pushes={len(NTFY_PUSHES)}")
+        log = Path(paths.RUN_LOG_FILE).read_text(encoding="utf-8")
+        check("豁免放行记了日志（可追踪，不静默）", "budget HARD" in log, "")
+    finally:
+        settings.cost["budget"] = orig_budget
+
+    # ======================================================================
+    print("\n[F3b] ★预算告警防重：软线每自然月最多一条；无 topic 静默跳过")
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+
+    _MONTH = _dt.now(_tz.utc).strftime("%Y%m")
+    _push_before = len(NTFY_PUSHES)
+    info_s = {"spent_micro_yuan": 25_000_000, "soft_micro_yuan": 24_000_000,
+              "hard_micro_yuan": 30_000_000}
+    # 先清掉可能存在的软线旗标，保证本段从「未提醒」状态开始
+    storage.set_kv(conn, f"budget_soft_warned_{_MONTH}", "")
+    chat._budget_notify(conn, "soft", info_s)
+    check("软线触发推送 1 次", len(NTFY_PUSHES) == _push_before + 1,
+          f"len={len(NTFY_PUSHES)}")
+    check("kv_state 记了防重复标记",
+          bool(storage.get_kv(conn, f"budget_soft_warned_{_MONTH}")), "")
+    chat._budget_notify(conn, "soft", info_s)
+    check("同月第二次不再推", len(NTFY_PUSHES) == _push_before + 1,
+          f"len={len(NTFY_PUSHES)}")
+    # 无 topic：清旗标 + 摘掉环境变量 → 应静默跳过（不推、不炸）
+    storage.set_kv(conn, f"budget_soft_warned_{_MONTH}", "")
+    _had_topic = _os.environ.pop("NTFY_TOPIC", None)
+    try:
+        chat._budget_notify(conn, "soft", info_s)
+        check("无 topic 静默跳过（不推、不炸）", len(NTFY_PUSHES) == _push_before + 1,
+              f"len={len(NTFY_PUSHES)}")
+    finally:
+        if _had_topic is not None:
+            _os.environ["NTFY_TOPIC"] = _had_topic
+
+    # ======================================================================
+    print("\n[F4] ★账本坏行单独计数（不再无声吞掉）")
+    ledger_path = Path(pricing.LEDGER_FILE)
+    lines_before = [l for l in ledger_path.read_text(encoding="utf-8").splitlines()
+                    if l.strip()]
+    ledger_path.write_text(
+        "\n".join(lines_before) + "\n{这行是故意的坏JSON\n", encoding="utf-8")
+    s = pricing.summarize()
+    check("summarize 报告 corrupt_lines=1", s.get("corrupt_lines") == 1,
+          str(s.get("corrupt_lines")))
+    check("read_ledger 仍只返回有效行",
+          len(pricing.read_ledger()) == len(lines_before), "")
+    text = pricing.format_summary(s)
+    check("格式化输出包含坏行告警", "账本损坏行" in text, "")
+    # 清理坏行，不污染后续断言
+    ledger_path.write_text("\n".join(lines_before) + "\n", encoding="utf-8")
 
     # ======================================================================
     # 最后：正式账本一行都没多
