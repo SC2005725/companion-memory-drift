@@ -987,8 +987,11 @@ class Handler(BaseHTTPRequestHandler):
             conn = storage.connect()
             try:
                 session, settings = _make_session(conn)
+                # 2026-11-21：自动整理改**后台**跑——M 批后整理一轮 31-45 秒，
+                # 同步执行会把回复扣住（实测 01:09 两轮：模型 1.5s 答完，
+                # 整理扣 31s）。回复先回，整理后台补。
                 result = chat.send_once(session, text, echo=lambda *_: None,
-                                        user_image=image)
+                                        user_image=image, auto_consolidate=False)
                 turn = result.get("turn") or {}
 
                 # P0-1：真实对话自动进入主体事件账本。
@@ -1004,6 +1007,25 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except Exception:  # noqa: BLE001
                     pass
+
+                # 自动整理后台补跑（独立连接+独立会话，同 _heartbeat_worker_once 模式）
+                import threading as _th
+
+                def _bg_consolidate():
+                    try:
+                        _conn = storage.connect()
+                        try:
+                            _sess = chat.new_session(
+                                persona=getattr(session, 'persona', None),
+                                settings=session.settings, client=session.client,
+                                peak_override=False, conn=_conn)
+                            chat.maybe_auto_consolidate(_sess, echo=lambda *_: None)
+                        finally:
+                            _conn.close()
+                    except Exception as exc:  # noqa: BLE001
+                        storage.log_line(f'后台整理失败（不影响回复）: {type(exc).__name__}: {exc}')
+
+                _th.Thread(target=_bg_consolidate, name='auto-consolidate-bg', daemon=True).start()
 
                 try:
                     status = collect_status(conn, settings)
