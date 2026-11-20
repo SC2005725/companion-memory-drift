@@ -1,0 +1,69 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths: ['apk/**', '.github/workflows/apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建共生遥控器 APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: 构建 APK（debug 签名，自用可装）
+        run: gradle -p apk assembleDebug --no-daemon
+
+      - name: 归集产物
+        run: |
+          mkdir -p dist
+          cp apk/app/build/outputs/apk/debug/app-debug.apk dist/gongsheng-remote-v1.0-debug.apk
+          ls -la dist/
+
+      - name: 上传构建产物（Actions 页面可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: gongsheng-remote-apk
+          path: dist/gongsheng-remote-v1.0-debug.apk
+
+      - name: 挂到 GitHub Release（Releases 页面直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-v1.0
+          name: 共生遥控器 APK v1.0
+          body: |
+            手机端遥控器（WebView 壳）。
+
+            ## 安装
+            1. 下载下方 `gongsheng-remote-v1.0-debug.apk`
+            2. 手机允许「安装未知来源应用」后安装
+            3. 首次启动粘贴服务地址（含 `?token=` 的完整链接，见 webui-token）
+
+            ## 要求
+            - 手机需已连接 Tailscale（同一虚拟网络）
+            - debug 签名：升级版本时请先卸载旧版再安装（服务端数据在电脑侧，不受影响）
+
+            ## 隐私
+            APK 内**不含**任何服务地址/域名/token——地址在首次启动时由使用者粘贴。
+          files: dist/gongsheng-remote-v1.0-debug.apk
+          overwrite_files: true
