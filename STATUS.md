@@ -1,6 +1,6 @@
 # 状态快照（**自动生成，勿手改**）
 
-生成时间：2026-11-16T00:19:04+08:00
+生成时间：2026-11-21T00:54:47+08:00
 
 > 本文件由 `python src\status_snapshot.py` **实跑生成**。
 > 会变的数字都集中在这里，其它文档只做定性描述并指向本文件 ——
@@ -36,16 +36,16 @@
 
 | 表 | 含义 | 条数 |
 |----|------|------|
-| `conversations` | 对话轮数 | 374 |
+| `conversations` | 对话轮数 | 375 |
 | `events` | 原始事件 | 24 |
-| `memory_versions` | 记忆版本 | 20 |
-| `retrievals` | 检索记录 | 380 |
+| `memory_versions` | 记忆版本 | 22 |
+| `retrievals` | 检索记录 | 381 |
 | `relationship_events` | 关系事件 | 12 |
 | `user_model_events` | 用户模型事件 | 12 |
 | `tool_calls` | 工具调用（含自测） | 57 |
-| `api_calls` | API 调用 | 406 |
-| `heartbeat_runs` | 心跳运行 | 214 |
-| `pending_actions` | 待处理意向（主动消息） | 35 |
+| `api_calls` | API 调用 | 408 |
+| `heartbeat_runs` | 心跳运行 | 289 |
+| `pending_actions` | 待处理意向（主动消息） | 43 |
 | `concern_injections` | 关注点留痕 P0（injected=1 才算真的进过上下文） | 11 |
 
 > ✅ **副作用已修复（2026-10-26）**：本脚本会实跑 `src/selftest.py`，
@@ -83,7 +83,7 @@
 
 ## 累计花费
 
-0.894133 元（425 次调用 / 832,957 tokens）
+0.940336 元（427 次调用 / 858,207 tokens）
 
 > 口径：`logs/ledger.jsonl` 里所有调用的估算费用之和。
 > ⚠️ 若与别的项目**共用同一个 API Key**，不能用账户余额反推本项目花费。
@@ -139,7 +139,7 @@
 Phase 10 如实说明 —— **这一期没有产生成本收益**：
 
 ```
-所有 406 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）
+所有 408 次调用都用 deepseek-flash；而它已经是最低档（输入 2 / 输出 8）
 → 「简单任务用便宜模型」没有更便宜的可用 → 省 0 元
 → 若把复杂任务送去 deepseek-v4-pro，反而贵 4.5 倍
 ```
