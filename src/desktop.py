@@ -186,8 +186,12 @@ def main() -> int:
 
     threading.Thread(target=_tray, daemon=True, name="tray").start()
 
+    # localStorage 持久化：pywebview 默认 private_mode=True（内存态），重启即清空——
+    # 老板 2026-11-21 实测「手动换的头像重启就没」的根因。关隐私模式并指定落盘目录。
+    storage_path = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "鹤辞" / "webview-profile"
+    storage_path.mkdir(parents=True, exist_ok=True)
     try:
-        webview.start()          # 阻塞到窗口销毁（真退出）
+        webview.start(private_mode=False, storage_path=str(storage_path))   # 阻塞到窗口销毁（真退出）
     finally:
         lock.close()
         # 只收我们自己拉起的后端；复用的别人进程一个不碰
