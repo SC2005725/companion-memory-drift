@@ -23,9 +23,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: 安装 Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
         with:
