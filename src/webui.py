@@ -160,9 +160,9 @@ def _load_or_create_token() -> str:
 #
 # ## 为什么原来只有回环地址，现在要加本机 IP
 #
-# 手机经局域网访问时写的是 `http://192.168.1.2:8765/`，于是：
-#   · Host 头 = `192.168.1.2:8765`
-#   · Origin  = `http://192.168.1.2:8765`
+# 手机经局域网访问时写的是 `http://<lan-ip>:8765/`，于是：
+#   · Host 头 = `<lan-ip>:8765`
+#   · Origin  = `http://<lan-ip>:8765`
 # 两者都不在 `_HOME_HOSTS` 里 → **403，手机根本连不上**。
 #
 # 所以把「**本机自己**的 IPv4」和「当前绑定地址」加进白名单。
@@ -171,7 +171,7 @@ def _load_or_create_token() -> str:
 #
 # 安全：这些地址**就是这台机器本身**，放行它们不等于放行外人。
 # Host 校验防的是 **DNS rebinding** —— 攻击者让它自己的域名解析到
-# `192.168.1.2`，但请求带的 Host 仍是 `evil.example` → 依然被拒 ✅
+# `<lan-ip>`，但请求带的 Host 仍是 `evil.example` → 依然被拒 ✅
 # Origin 校验防的是跨源 CSRF —— 恶意页面带的是它自己的 Origin → 依然被拒 ✅
 #
 # **令牌仍然必查**，局域网不等于免鉴权。
@@ -281,6 +281,25 @@ def _make_session(conn):
 # 侧栏数据：把「得打命令才看得见」的东西一次性取出来
 # ----------------------------------------------------------------------------
 
+# 前端 UI 适配层（2026-11-21）：把领域数据翻译成 webui 页面需要的展示口径。
+# 情绪域（emotion.py）只有 name/description/half_life —— 效价和配色是展示层口径，
+# 放这里不污染领域模块；记忆分类配色同理。
+_EMOTION_PRESENTATION = {
+    "calm":   (0.0,  "#64748b"),
+    "fond":   (0.5,  "#f26d85"),
+    "glad":   (0.8,  "#34d399"),
+    "low":    (-0.7, "#6d5bd8"),
+    "uneasy": (-0.4, "#f59e0b"),
+    "care":   (0.3,  "#0ea5e9"),
+    "tired":  (-0.3, "#94a3b8"),
+}
+_MEMORY_CAT_COLOR = {
+    "个人事实": "#0c9b8a", "偏好": "#6d5bd8", "计划": "#0866ff",
+    "项目状态": "#f59e0b", "关系经历": "#f26d85", "生活事项": "#34d399",
+    "共同经历": "#0ea5e9", "未分类": "#c9cfdd",
+}
+
+
 def collect_status(conn, settings) -> dict:
     import memory as memory_mod
     import pricing
@@ -290,14 +309,22 @@ def collect_status(conn, settings) -> dict:
 
     out: dict = {}
 
-    # 记忆
+    # 记忆（2026-11-21 增补：前端「记忆 · 漂移星图」还需要 cat/categories/versions）
     try:
         mv = memory_mod.load_latest()
+        items = ([{"type": it.type, "cat": it.category or "未分类", "text": it.text}
+                  for it in mv.items] if mv else [])
+        cat_count: dict = {}
+        for it in items:
+            cat_count[it["cat"]] = cat_count.get(it["cat"], 0) + 1
         out["memory"] = {
             "version": mv.version if mv else None,
-            "count": len(mv.items) if mv else 0,
-            "items": ([{"type": it.type, "text": it.text} for it in mv.items]
-                      if mv else []),
+            "count": len(items),
+            "items": items,
+            "categories": [{"name": k, "count": v,
+                            "color": _MEMORY_CAT_COLOR.get(k, "#c9cfdd")}
+                           for k, v in sorted(cat_count.items(), key=lambda kv: -kv[1])],
+            "versions": [row["version"] for row in storage.list_memory_versions(conn)],
         }
     except Exception as exc:
         out["memory"] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -370,7 +397,136 @@ def collect_status(conn, settings) -> dict:
     except Exception as exc:
         out["stats"] = {"error": f"{type(exc).__name__}: {exc}"}
 
+    # 情绪（2026-11-21：前端「情感 · 极光场」页需要 st.emotion —— 此前 collect_status
+    # 从未提供这个键，页面永远渲染「待机」空态。数据来自 emotion 模块的持久状态；
+    # emotion/ 目录还没有首批快照时如实给空态，不编造数值。）
+    try:
+        import emotion as emotion_mod
+        state = emotion_mod.load_state(decay=True)
+        if state and state.emotions and any(v > 0 for v in state.emotions.values()):
+            total = sum(state.emotions.values()) or 1.0
+            mix = []
+            for name, inten in sorted(state.emotions.items(), key=lambda kv: -kv[1]):
+                if inten <= 0:
+                    continue
+                val, color = _EMOTION_PRESENTATION.get(name, (0.0, "#64748b"))
+                mix.append({"name": name, "pct": round(inten / total * 100),
+                            "color": color})
+            dom = state.dominant() or ""
+            dom_val, _dom_color = _EMOTION_PRESENTATION.get(dom, (0.0, "#64748b"))
+            out["emotion"] = {
+                "current": {"label": dom, "valence": dom_val},
+                "mix": mix,
+                "days": [],   # 情绪快照历史积累起来后接入曲线（emotion/ 目录首批出现时）
+            }
+        else:
+            out["emotion"] = {"current": {}, "mix": [], "days": []}
+    except Exception as exc:
+        out["emotion"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # 心跳（2026-11-21：前端「心跳 · 节律」页需要 st.heartbeat —— 同样一直缺键。
+    # 数据全部从 heartbeat_runs 表只读派生，间隔口径与 core_api 心跳 worker 一致（1800s）。）
+    try:
+        hb_rows = storage.list_heartbeat_runs(conn, limit=12)
+        hb_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM heartbeat_runs").fetchone()["c"]
+        hb_last = hb_rows[0] if hb_rows else None
+
+        def _fmt(s):
+            return ((s or "")[5:16].replace("T", " "))   # MM-DD HH:MM
+
+        hb_next = "—"
+        if hb_last:
+            try:
+                from datetime import datetime as _dt
+                from datetime import timedelta as _td
+                hb_next = (_dt.fromisoformat(hb_last["created_at_local"])
+                           + _td(minutes=30)).strftime("%m-%d %H:%M")
+            except ValueError:
+                hb_next = "—"
+
+        out["heartbeat"] = {
+            "interval": "30 分钟",
+            "runs": hb_total,
+            "last": _fmt(hb_last["created_at_local"]) if hb_last else "—",
+            "next": hb_next,
+            "levels": [
+                {"proactive_message": 1.0, "pending": 1.0,
+                 "delivered": 1.0}.get(r["decision"], 0.4 if r["decision"] == "no_action" else 0.3)
+                for r in hb_rows],
+            "recent": [{"t": _fmt(r["created_at_local"]), "d": r["decision"],
+                        "note": (r["message"] or r["reason"] or "")[:80]}
+                       for r in hb_rows[:6]],
+        }
+    except Exception as exc:
+        out["heartbeat"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # 记忆版本历史（系统 · 脉络页曲线）：最近 20 版（升序取尾部，画增速放缓用）
+    try:
+        rows = storage.list_memory_versions(conn)
+        out["memory"]["version_history"] = [
+            {"version": r["version"], "items": r["item_count"],
+             "at": ((r["created_at_local"] or "")[5:16]).replace("T", " ")}
+            for r in rows][-20:]
+    except Exception as exc:  # noqa: BLE001
+        out["memory"]["version_history"] = []
+
+    # 观察判据（系统 · 脉络页徽章）：三个「等自然发生」的里程碑
+    out["flags"] = _observation_flags(out)
+
     return out
+
+
+# 「按条蒸馏」首触发标志的缓存：以 run.log 大小为指纹，日志没涨就不重扫
+_SEG_LOG_CACHE = {"size": -1, "hit": False}
+
+# 系统 · 脉络页聚合接口的 TTL 缓存：手机端 30s 轮询一次即可，
+# 多标签/快速刷新在 8s 内直接命中同一份，不连环打 core
+_SYS_CACHE = {"ts": 0.0, "payload": None}
+
+
+def _segment_distilled_flag() -> bool:
+    """run.log 里出现 consolidate 按条蒸馏 v2 的留痕 = 首次真实触发。"""
+    log_path = HTML_FILE.parent.parent / "logs" / "run.log"
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return False
+    c = _SEG_LOG_CACHE
+    if c["hit"]:
+        return True          # 一旦点亮就是事实，日志轮转也不回头
+    if size == c["size"]:
+        return False
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, size - 400_000))
+            if "consolidate 按条蒸馏" in f.read():
+                c["hit"] = True
+    except OSError:
+        return False
+    c["size"] = size
+    return c["hit"]
+
+
+def _observation_flags(out: dict) -> dict:
+    """观察判据（数据驱动，后端加键前端即多一枚徽章）：
+    segment_distilled 分段蒸馏首触发 · provisional 人格发展闭环 ·
+    emotion_days 情绪快照积累到可画曲线。全部「等自然发生」。"""
+    try:
+        seg = _segment_distilled_flag()
+    except Exception:  # noqa: BLE001
+        seg = False
+    try:
+        prof = json.loads((HTML_FILE.parent.parent / "personality" / "profile.json")
+                          .read_text(encoding="utf-8"))
+        prov = "provisional" in prof
+    except Exception:  # noqa: BLE001
+        prov = False
+    try:
+        emo = bool((out.get("emotion") or {}).get("days"))
+    except Exception:  # noqa: BLE001
+        emo = False
+    return {"segment_distilled": seg, "provisional": prov, "emotion_days": emo}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -563,6 +719,60 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._json({"ok": False, "error": f"核心服务不可达（{type(exc).__name__}）"}, 502)
 
+    def _core_get(self, path: str, timeout: float = 6.0):
+        """带核心令牌的只读代理 GET（本机 core_api）。"""
+        req = urllib.request.Request(
+            f"http://127.0.0.1:8770{path}",
+            headers={"Authorization": f"Bearer {self._core_token()}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _system(self) -> None:
+        """系统 · 脉络页聚合接口（前后端连通优化，2026-11-21）：
+
+        手机端**一次轮询一个接口**拿全页数据：
+          · status（曲线/计数/摘要/判据）—— 本地只读，零费用
+          · pool / instances / approvals —— 服务端代拉 core（同机 HTTP，零令牌暴露）
+        8 秒 TTL 缓存；core 不可达时对应块降级，页面其余部分照常。
+        """
+        import time as _time
+        now = _time.time()
+        c = _SYS_CACHE
+        if c["payload"] is not None and now - c["ts"] < 8.0:
+            self._json(c["payload"], 200)
+            return
+
+        import storage
+        from config import load_settings
+
+        conn = storage.connect()
+        try:
+            settings = load_settings()
+            st = collect_status(conn, settings)
+        except Exception as exc:  # noqa: BLE001
+            st = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            conn.close()
+
+        sysout = {"status": st, "pool": [], "instances": [],
+                  "approvals": [], "core_ok": True}
+        for key, core_path in (("pool", "/api/tasks/pool?limit=50"),
+                               ("instances", "/api/instances"),
+                               ("approvals",
+                                "/api/approvals/list?status=pending")):
+            try:
+                d = self._core_get(core_path)
+                sysout[key] = (d.get("tasks") or d.get("instances")
+                               or d.get("approvals") or [])
+            except Exception as exc:  # noqa: BLE001
+                sysout["core_ok"] = False
+                sysout[key + "_error"] = type(exc).__name__
+
+        payload = {"ok": True, "system": sysout}
+        c["payload"] = payload
+        c["ts"] = now
+        self._json(payload, 200)
+
     def _route_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -595,6 +805,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._status()
+            return
+        if path == "/api/system":
+            self._system()
             return
         if path == "/api/history":
             self._history()

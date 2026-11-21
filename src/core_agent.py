@@ -187,6 +187,26 @@ def main(argv=None) -> int:
     tok = (core.CORE_DIR / "api-token").read_text(encoding="utf-8").strip()
     c = CoreClient("http://127.0.0.1:8770", tok, timeout=25)
 
+    # 【任务池】看池认领（2026-11-21，Muse 设计/老板拍板）：
+    #   只自动认领 risk=low 的池单（与现有自动接单同口径，fail-closed）；
+    #   认领后 to_instance 变本席位，下方 inbox 流程原样接管（硬闸/执行/释放）。
+    #   409 = 被其他席位抢先，正常跳过；点名单照旧不碰。
+    try:
+        for pt in (c.pool_tasks().get("tasks") or []):
+            if (pt.get("risk") or "").lower() != "low":
+                continue
+            _ptgt = target_of(pt)
+            if _ptgt and _ptgt not in _TARGET_SELF:
+                continue
+            try:
+                c.claim(pt["task_id"], ME)
+                log(f"  池单 {pt['task_id']} 已认领：{(pt.get('title') or '')[:40]}")
+            except CoreError as e:
+                if e.status != 409:
+                    log(f"  池单 {pt['task_id']} 认领失败：{e.status}")
+    except CoreError as e:
+        log(f"看池失败（跳过，不影响指定单）：{e.status}")
+
     try:
         tasks = (c.tasks(instance_id=ME, role="inbox").get("tasks") or [])
     except CoreError as e:
@@ -194,11 +214,17 @@ def main(argv=None) -> int:
         return 1
 
     # 2026-11-08 修：原来只认 SENT，导致「已经被接单、但没执行」的任务永远卡死。
-    # 2026-11-11 再修：ACCEPTED 不能再进来 —— 需人工的任务会停在 ACCEPTED，
-    # 若继续轮询就会无限循环（每次都不执行、又都不结束）。
+    # 2026-11-11 再修：ACCEPTED 不能再进来 —— 当时的场景是 plan_for=None 的任务
+    #   停在 ACCEPTED 且每轮写 result 抢闭环。
     # 2026-11-15 加：WAITING 也进来 —— 危险指令硬闸把任务挂 WAITING 等审批，
-    # 批准后要能从这里恢复执行（否则审批完的任务永远冻结）。
-    ACTIONABLE = ("SENT", "RECEIVED", "WAITING")
+    #   批准后要能从这里恢复执行（否则审批完的任务永远冻结）。
+    # 2026-11-21 再加回 ACCEPTED：**旧理由已失效**——①plan_for=None 的任务现在
+    #   只写一条 dedup 的 dev_note（不再每轮写 result 抢闭环），每轮干净跳过；
+    #   ②core_api 巡检（60s）会对显式 low 风险的任务自动接单 → ACCEPTED，
+    #   若巡查器跳过 ACCEPTED，这些带结构化载荷的任务就**永远没人执行**
+    #   （dispatch_task 上线首单实测卡死在这里）。需人工的判定交给 plan_for
+    #   返回 None（留 ACCEPTED 等人），不再由状态一刀切。
+    ACTIONABLE = ("SENT", "RECEIVED", "WAITING", "ACCEPTED")
     pending = [t for t in tasks if t.get("status") in ACTIONABLE]
     log(f"本轮：待处理 {len(pending)} 个"
         f"（SENT {sum(1 for t in pending if t.get('status') == 'SENT')} / "
@@ -271,9 +297,14 @@ def main(argv=None) -> int:
                     import heartbeat
                     topic = heartbeat.ntfy_topic_from_env()
                     if topic:
+                        # T6（2026-11-21）：审批通知带「批准/拒绝」按钮——
+                        # 只有真实审批单（_ap 存在）才带；dry 演练保持纯文本。
+                        _actions = (heartbeat.build_approval_actions(
+                            _ap["approval_id"]) if _ap else None)
                         heartbeat.deliver_to_ntfy(
                             topic, f"鹤辞：有危险指令待审批\n{t.get('title')}\n"
-                                   f"类别：{_danger}\n（审批单 {_ap['approval_id'] if _ap else '（dry）'}，{tid}）")
+                                   f"类别：{_danger}\n（审批单 {_ap['approval_id'] if _ap else '（dry）'}，{tid}）",
+                            actions=_actions)
                 except Exception:  # noqa: BLE001
                     pass
                 log(f"  {tid} 危险指令（{_danger}）：审批单 "
@@ -287,6 +318,16 @@ def main(argv=None) -> int:
 
         ops = plan_for(t)
         if ops is None:
+            # 【任务池】本席位做不了的池单 → 释放回池换人接（Muse 设计 §二.3），
+            # 不能赖在 ACCEPTED 挡别人的路。指定单维持原行为：留 ACCEPTED 等人工。
+            if (t.get("claimed_by") or "") == ME and not dry:
+                try:
+                    c.release(tid, ME, "本席位无此任务的执行能力（plan_for=None），释放回池")
+                    log(f"  {tid} 池单释放回池（做不了，换人接）")
+                except CoreError as e:
+                    log(f"  {tid} 释放失败：{e.status}")
+                done += 1
+                continue
             # 2026-11-11 修：**不再写 result**。
             # 原来写「已接单，未执行」→ 状态变 COMPLETED，而状态机没有 reopen，
             # 人工事后分析完就无法回填（task_ab7f9c6715ca 真实踩到）。

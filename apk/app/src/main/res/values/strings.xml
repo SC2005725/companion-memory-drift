@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">鹤辞</string>
+    <string name="config_title">鹤辞 · 连接设置</string>
+    <string name="config_version">WebView 版 v0.6 · 审批按钮 · 2026-11-21 构建</string>
+    <string name="config_hint" formatted="false">服务地址两种任选：\n  · 在家直连  http://<lan-ip>:8901\n  · 外网 tailnet  https://<desktop-id>.<tailnet>.ts.net:8445\n\n令牌不是路径！在电脑按 Win+R 运行：\n  notepad %LOCALAPPDATA%\\xiaoman\\webui-token\n把打开文件里那串随机字符复制到下面</string>
+    <string name="config_url_hint">服务地址</string>
+    <string name="config_token_hint">访问令牌（文件里的那串随机字符）</string>
+    <string name="config_push_hint">推送 topic（可选，填了就开启她的消息手机推送）</string>
+    <string name="config_save">保存并连接</string>
+    <string name="menu_reconfig">重新配置</string>
+    <string name="topbar_settings">设置</string>
+    <string name="empty_tagline">因你而生，与你共生</string>
+    <string name="status_online">在线</string>
+    <string name="status_offline">未连接</string>
+    <string name="status_connecting">连接中…</string>
+    <string name="dialog_title">连接失败</string>
+    <string name="dialog_msg_suffix">\n\n请检查：电脑后端是否在跑（start-backend-lan.bat）、地址和令牌是否填对</string>
+    <string name="dialog_retry">重试</string>
+    <string name="dialog_reconfig">重新配置</string>
+    <string name="dialog_not_connected">尚未连接到鹤辞的后端，无法发送消息。</string>
+    <string name="input_hint">给鹤辞发消息…</string>
+    <string name="send">发送</string>
+    <string name="send_fail_prefix">发送失败：\n</string>
+</resources>

@@ -93,11 +93,38 @@ def deny_reason(path: Path) -> str:
     return ""
 
 
+# 额外白名单目录（2026-11-21，老板授权的写权限扩展）：
+# 配置来源 settings.tools.fs_extra_write_dirs，由 core_api/webui 启动时注入。
+# 校验逻辑原样保留（deny_reason 照查），只是「授权范围」从写死变配置 —— 与
+# 工具权限档同一哲学。默认空 = 项目 ROOT 内（今天之前的行为）。
+EXTRA_WRITE_ROOTS: list = []
+
+
+def set_extra_write_roots(dirs) -> None:
+    import os as _os
+    EXTRA_WRITE_ROOTS.clear()
+    for d in dirs or []:
+        d = str(d or "").strip()
+        if d and _os.path.isdir(d):
+            EXTRA_WRITE_ROOTS.append(str(Path(d).resolve()))
+
+
 def resolve(rel: str) -> Path:
-    """把相对路径解析到项目内。越界、敏感一律抛 FsError。"""
+    """把路径解析到项目内或白名单目录内。越界、敏感一律抛 FsError。"""
     rel = (rel or "").strip().lstrip("/\\").replace("\\", "/")
     if not rel or rel == ".":
         return ROOT
+    cand = Path(rel)
+    if cand.is_absolute():
+        # 绝对路径：只在显式白名单目录内放行（含 ROOT 内的绝对路径）
+        target = cand.resolve()
+        if str(target).startswith(str(ROOT.resolve())) or any(
+                str(target).startswith(str(x)) for x in EXTRA_WRITE_ROOTS):
+            reason = deny_reason(target)
+            if reason:
+                raise FsError(reason)
+            return target
+        raise FsError(f"越界：{rel} 不在项目目录或白名单目录内") from None
     target = (ROOT / rel).resolve()
     try:
         target.relative_to(ROOT)

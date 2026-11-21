@@ -240,25 +240,41 @@ def build_user_message_ex(events: list[dict], turns: list[dict],
 
     meta["truncated"] = True
 
-    # ① 弃最老的原始事件 —— 数据库里都有底，下一轮全量再带，零丢失。
-    events_kept = full_events
-    while len(text) > MAX_CONVERSATION_CHARS and events_kept > 0:
-        events_kept -= 1
-        text = _assemble(events_kept, full_memory, 0)
-    meta["events_kept"] = events_kept
+    # 2026-11-21 **重排裁剪优先级**（修「整理员失忆」恶性循环）：
+    # 旧版先弃事件、再弃记忆、最后才动对话 —— 实测 288 轮对话把 24000 预算吃光，
+    # events 0/24、memory 0/711：整理员每轮都看不到旧记忆和原始事件。
+    # 后果连锁：① 无法对照旧记忆去重 → 条目无界增长（584→711→740）→ 输入更爆；
+    # ② 情绪提案永远拿不到事件 ID → emotion 链路结构性不可能（提示词齐备也没用）。
+    # 新优先级：**对话最先裁**（它本来就是「弃头下轮重喂」的设计，游标回退零丢失）；
+    # 事件保最新 12 条（情绪提案的证据锚点）；旧记忆最新优先吃到子预算（去重窗口）。
+    _EVENTS_KEPT_MAX = 12          # 原始事件：保最新 12 条（证据锚点足够）
+    _MEMORY_SUB_BUDGET = 12000     # 旧记忆段子预算（字符）：最新条目优先
+    events_kept = min(full_events, _EVENTS_KEPT_MAX)
 
-    # ② 弃最老的旧记忆条目 —— 版本文件里有底，下一轮还会再列，零丢失。
+    # 记忆：最新优先，吃到子预算为止（mem_lines 按条目顺序排列，最新在后）
     memory_kept = full_memory
-    while len(text) > MAX_CONVERSATION_CHARS and memory_kept > 0:
-        memory_kept -= 1
-        text = _assemble(events_kept, memory_kept, 0)
-    meta["memory_kept"] = memory_kept
+    _mem_chars = 0
+    for _i in range(full_memory - 1, -1, -1):
+        _mem_chars += len(mem_lines[_i])
+        if _mem_chars > _MEMORY_SUB_BUDGET:
+            memory_kept = full_memory - 1 - _i
+            break
 
-    # ③ 最后才动对话：保尾弃头，**至少保 1 轮**；单轮超限时放行超限。
+    text = _assemble(events_kept, memory_kept, 0)
+
+    # ① 对话：保尾弃头，**至少保 1 轮**；单轮超限时放行超限。
     turns_from = 0
     while len(text) > MAX_CONVERSATION_CHARS and turns_from < len(turn_lines) - 1:
         turns_from += 1
         text = _assemble(events_kept, memory_kept, turns_from)
+
+    # ② 兜底：极端超限才动事件（保最新，从最老的开始弃）。
+    while len(text) > MAX_CONVERSATION_CHARS and events_kept > 0:
+        events_kept -= 1
+        text = _assemble(events_kept, memory_kept, turns_from)
+
+    meta["events_kept"] = events_kept
+    meta["memory_kept"] = memory_kept
     meta["turns_in_prompt"] = len(turn_lines) - turns_from
     if turns_from > 0:
         meta["turns_kept_from_seq"] = turns[turns_from]["seq"]
@@ -633,6 +649,56 @@ def merge_items(payload: dict, known_event_ids: set[str], version: str,
 
 
 
+def _merge_segment_payloads(payloads: list[dict]) -> dict:
+    """M-6 v2（按条蒸馏）：把各段蒸馏的 payload 合并成一个。
+
+    items / deletes 拼接；emotion_revision / developing_revision 取**第一条**
+    非空提案（提示词规定每段最多一条，整轮也只消费一条）。
+    """
+    combined: dict = {"items": []}
+    deletes: list = []
+    for p in payloads:
+        if not isinstance(p, dict):
+            continue
+        items = p.get("items")
+        if isinstance(items, list):
+            combined["items"].extend(items)
+        dl = p.get("deletes")
+        if isinstance(dl, list):
+            deletes.extend(dl)
+    if deletes:
+        combined["deletes"] = deletes
+    for key in ("emotion_revision", "developing_revision"):
+        for p in payloads:
+            if isinstance(p, dict) and p.get(key):
+                combined[key] = p[key]
+                break
+    return combined
+
+
+def _merge_segment_meta(seg_meta: list[dict]) -> dict:
+    """把各段的截断审计合并成「单次调用」的形状 —— source_range /
+    resolve_cursor / input_truncation 的消费方完全不用改。
+
+    游标语义：任何一段发生了对话截断，游标就回退到**最早**被截段的安全水位
+    （宁重勿丢；重喂的部分靠「现有记忆」段去重）。全部段都完整进 prompt 时
+    游标照常推进到最后一条。
+    """
+    rolled = [m.get("turns_kept_from_seq") for m in seg_meta
+              if m.get("turns_kept_from_seq") is not None]
+    return {
+        "truncated": any(m.get("truncated") for m in seg_meta),
+        "events_kept": sum(m.get("events_kept", 0) for m in seg_meta),
+        "events_total": max((m.get("events_total", 0) for m in seg_meta), default=0),
+        "memory_kept": max((m.get("memory_kept", 0) for m in seg_meta), default=0),
+        "memory_total": max((m.get("memory_total", 0) for m in seg_meta), default=0),
+        "turns_total": sum(m.get("turns_total", 0) for m in seg_meta),
+        "turns_in_prompt": sum(m.get("turns_in_prompt", 0) for m in seg_meta),
+        "turns_kept_from_seq": (min(rolled) if rolled else None),
+        "oversize_allowed": any(m.get("oversize_allowed") for m in seg_meta),
+    }
+
+
 def consolidate(session, *, note: str = "") -> dict:
     """执行一次记忆整理，产出新的记忆版本 + 与上一版的差异记录。
 
@@ -671,40 +737,94 @@ def consolidate(session, *, note: str = "") -> dict:
 
     # 雷 1：必须用 _ex 拿截断审计 —— 游标只能推进到「真正进过 prompt」的安全水位，
     # 否则被截断的对话会被谎报为已整理，静默永久丢失。
-    user_message, build_meta = build_user_message_ex(
-        events, new_turns,
-        previous_items=(previous.items if previous is not None else None),
-        developing_items=_dev_items,
-    )
-    if build_meta["truncated"]:
-        storage.log_line(
-            f"consolidate 输入截断：events {build_meta['events_kept']}/"
-            f"{build_meta['events_total']}，memory {build_meta['memory_kept']}/"
-            f"{build_meta['memory_total']}，turns {build_meta['turns_in_prompt']}/"
-            f"{build_meta['turns_total']}（游标见 source_range，被弃轮次下轮重喂）"
-        )
-    messages = [
-        {"role": "system", "content": prompt_body},
-        {"role": "user", "content": user_message},
-    ]
+
+    # M-6 v2（2026-11-21）：按条蒸馏。settings.consolidate.segment_turns > 0 且
+    # 积压轮次超过段长时，把新对话**拆段、逐段聚焦蒸馏**，再合并进同一版本。
+    # 每段都是完整管线（原始事件 + 记忆摘要 + 本段对话）—— 合并走既有 merge_items，
+    # 版本/changelog/游标语义全部不变。积压 ≤段长时行为与旧版完全一致。
+    seg_size = 0
+    try:
+        _cs = getattr(session.settings, "consolidate", None) or {}
+        seg_size = int(_cs.get("segment_turns") or 0)
+    except Exception:  # noqa: BLE001 — 配置坏了就退回单次调用
+        seg_size = 0
+
+    payloads: list[dict] = []
+    seg_meta: list[dict] = []
+    seg_cost: list[int] = []
+    reply_model = ""
+    build_meta: dict = {}
 
     import chat as chat_mod
 
-    # 整理任务需要比对话大得多的输出预算。
-    #
-    # 实测事故：整理 34 轮对话时，deepseek-flash（推理模型）**思考单独就吃了 3201 个 token
-    # 还没结束**，`finish_reason='length'`、`content` 为空 —— 整个整理直接失败。
-    # 原因：整理要一次性读完整段对话 + 全部原始事件，推理量远大于单轮闲聊。
-    # 所以按用途取预算（settings.json 的 max_tokens_by_purpose.consolidate）。
-    #
-    # P1（max_tokens 还原，2026-11-08）：session.client 是**长命对象**——
-    # 之前整理完预算留在 client 上，之后的闲聊一路用整理的大预算（15 倍漂移，
-    # 两路审查独立发现）。现在进整理放大、离开必还原（异常也还原）。
-    with _consolidate_budget(session):
-        called = chat_mod.call_model(session, messages, purpose="consolidate")
-    reply = called["reply"]
+    if seg_size > 0 and len(new_turns) > seg_size:
+        segments = [new_turns[i:i + seg_size]
+                    for i in range(0, len(new_turns), seg_size)]
+        storage.log_line(
+            f"consolidate 按条蒸馏 v2：{len(new_turns)} 轮拆 {len(segments)} 段"
+            f"（每段 ≤{seg_size} 轮）")
+        for si, seg in enumerate(segments):
+            user_message_i, meta_i = build_user_message_ex(
+                events, seg,
+                previous_items=(previous.items if previous is not None else None),
+                developing_items=_dev_items,
+            )
+            seg_meta.append(meta_i)
+            if meta_i.get("truncated"):
+                storage.log_line(
+                    f"  段{si + 1} 输入超限：turns {meta_i['turns_in_prompt']}/"
+                    f"{meta_i['turns_total']}（本段被弃轮次下轮重喂）")
+            messages_i = [
+                {"role": "system", "content": prompt_body},
+                {"role": "user", "content": user_message_i},
+            ]
+            with _consolidate_budget(session):
+                called_i = chat_mod.call_model(session, messages_i,
+                                               purpose="consolidate")
+            reply_model = called_i["reply"].model or reply_model
+            seg_cost.append(int(called_i.get("cost_micro_yuan") or 0))
+            payloads.append(extract_json(called_i["reply"].text))
+        payload = _merge_segment_payloads(payloads)
+        build_meta = _merge_segment_meta(seg_meta)
+        # 合成等价的 reply / cost：返回字典与下游消费方形状不变
+        from types import SimpleNamespace as _NS
+        reply = _NS(text=json.dumps(payload, ensure_ascii=False),
+                    model=reply_model,
+                    usage=_NS(prompt_tokens=0, completion_tokens=0))
+        cost_micro_yuan = sum(seg_cost)
+        if build_meta["truncated"]:
+            storage.log_line(
+                f"consolidate 按条蒸馏合并审计：events {build_meta['events_kept']}/"
+                f"{build_meta['events_total']}，memory {build_meta['memory_kept']}/"
+                f"{build_meta['memory_total']}，turns {build_meta['turns_in_prompt']}/"
+                f"{build_meta['turns_total']}")
+    else:
+        # 旧路径：单次全量调用（积压 ≤段长 或 segment_turns=0）
+        user_message, build_meta = build_user_message_ex(
+            events, new_turns,
+            previous_items=(previous.items if previous is not None else None),
+            developing_items=_dev_items,
+        )
+        if build_meta["truncated"]:
+            storage.log_line(
+                f"consolidate 输入截断：events {build_meta['events_kept']}/"
+                f"{build_meta['events_total']}，memory {build_meta['memory_kept']}/"
+                f"{build_meta['memory_total']}，turns {build_meta['turns_in_prompt']}/"
+                f"{build_meta['turns_total']}（游标见 source_range，被弃轮次下轮重喂）"
+            )
+        messages = [
+            {"role": "system", "content": prompt_body},
+            {"role": "user", "content": user_message},
+        ]
+        with _consolidate_budget(session):
+            called = chat_mod.call_model(session, messages, purpose="consolidate")
+        reply = called["reply"]
+        reply_model = reply.model
+        payload = extract_json(reply.text)
+        cost_micro_yuan = int(called.get("cost_micro_yuan") or 0)
 
-    payload = extract_json(reply.text)
+    # 整理任务需要比对话大得多的输出预算（进段前放大、离开还原 —— 见
+    # _consolidate_budget 与上方的实测事故注释；分段模式每段各自放大还原）。
     known = {e["event_id"] for e in events}
     # V1.1：本次整理的**统一时间戳**。同一次整理里所有新条目共用它，
     # 保证「同一批记忆的时间一致」，便于事后按批次追溯。
@@ -764,7 +884,7 @@ def consolidate(session, *, note: str = "") -> dict:
     mv = memory_mod.MemoryVersion(
         version=version,
         created_at=storage.now_local(),
-        model=reply.model,
+        model=reply_model,
         items=items,
         source_range=source_range,
         previous_version=(previous.version if previous else None),
@@ -776,7 +896,7 @@ def consolidate(session, *, note: str = "") -> dict:
     storage.record_memory_version(
         session.conn,
         version=version,
-        model=reply.model,
+        model=reply_model,
         item_count=len(items),
         file=saved["file"],
         file_sha256=saved["sha256"],
@@ -892,7 +1012,7 @@ def consolidate(session, *, note: str = "") -> dict:
         "developing_revision": revision_result,
         "emotion_revision": emotion_result,
         "reply": reply,
-        "cost_micro_yuan": called["cost_micro_yuan"],
+        "cost_micro_yuan": cost_micro_yuan,
         "prompt_sha256": prompt_sha,
         "previous": previous.version if previous else None,
     }

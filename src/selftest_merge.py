@@ -220,7 +220,9 @@ def main() -> int:
 
     # ---------------- P9 雷1 回归：截断保尾弃头 + 游标安全水位 ----------------
     # 旧版 text[:MAX] 保头弃尾，砍掉的正是本轮新对话，而游标照样推进 → 静默永久丢。
-    # 新版：事件/旧记忆先弃（有底，下轮重带），对话保尾弃头，游标回退宁重勿丢。
+    # 2026-11-21 更正：裁剪优先级重排为「对话最先裁（游标回退重喂），事件保最新
+    # 12 条，旧记忆最新优先吃子预算」—— 旧顺序实测把事件和记忆全部裁光
+    # （events 0/24、memory 0/711），整理员每轮失忆、条目无界增长。断言不变。
     print("\n[P9] 雷1 回归：截断保尾弃头，游标只记真正进 prompt 的 seq")
     import consolidate as _cons
     _max_backup = _cons.MAX_CONVERSATION_CHARS
@@ -305,6 +307,34 @@ def main() -> int:
 
     # ---------------- 汇总 ----------------
     print("\n" + "=" * 76)
+    # ---------------- SEG 按条蒸馏 v2（M-6）：payload 合并与游标合并 ----------------
+    print("\n[SEG] 按条蒸馏 v2：段 payload 合并 + 游标合并")
+    import consolidate as _cons2
+
+    p1 = {"items": [{"type": "FACT", "text": "段一的事实", "source_event_ids": ["e1"]}],
+          "emotion_revision": {"changes": {"care": "+1"}, "evidence_event_ids": ["e1"], "reason": "r1"}}
+    p2 = {"items": [{"type": "FACT", "text": "段二的事实", "source_event_ids": []}],
+          "deletes": [{"id": "mem_old3", "reason": "段二判废"}]}
+    p3 = {"items": [{"type": "EPISODE", "text": "段三的经历", "source_event_ids": []}]}
+    comb = _cons2._merge_segment_payloads([p1, p2, p3])
+    check("SEG items 三段拼接", len(comb["items"]) == 3, str(len(comb["items"])))
+    check("SEG deletes 拼接", comb.get("deletes") == p2["deletes"], str(comb.get("deletes")))
+    check("SEG 情绪提案取第一条", comb.get("emotion_revision") == p1["emotion_revision"], "")
+    m1 = {"truncated": False, "events_kept": 12, "events_total": 24, "memory_kept": 152,
+          "memory_total": 740, "turns_total": 40, "turns_in_prompt": 40,
+          "turns_kept_from_seq": None, "oversize_allowed": False}
+    m2 = {"truncated": True, "events_kept": 12, "events_total": 24, "memory_kept": 152,
+          "memory_total": 740, "turns_total": 40, "turns_in_prompt": 12,
+          "turns_kept_from_seq": 5, "oversize_allowed": False}
+    meta = _cons2._merge_segment_meta([m1, m2])
+    check("SEG 审计：turns 求和", meta["turns_in_prompt"] == 52 and meta["turns_total"] == 80,
+          str(meta["turns_in_prompt"]))
+    check("SEG 审计：事件/记忆取峰值", meta["memory_kept"] == 152 and meta["events_kept"] == 24, "")
+    check("SEG 游标：段内截断 → 回退到最早安全水位", meta["turns_kept_from_seq"] == 5,
+          str(meta["turns_kept_from_seq"]))
+    check("SEG 截断标记任一命中", meta["truncated"] is True, "")
+    check("SEG 空段列表不崩", _cons2._merge_segment_payloads([]) == {"items": []}, "")
+
     failed = [n for n, g, _ in CHECKS if not g]
     for n, g, d in CHECKS:
         if not g:

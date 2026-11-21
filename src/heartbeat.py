@@ -359,7 +359,26 @@ def ntfy_topic_from_env() -> str:
     return (os.environ.get(NTFY_ENV_KEY) or "").strip()
 
 
-def deliver_to_ntfy(topic: str, message: str) -> bool:
+def build_approval_actions(approval_id: str, title: str = "") -> list:
+    """T6（2026-11-21）：构造审批通知的「批准/拒绝」按钮（ntfy actions 格式）。
+
+    纯函数，零网络零 IO —— 离线可单测。
+    安全面：载荷里只有 approval_id + decision 标记，**没有任何凭据**——
+    令牌永远只存在手机 APP 里，裁决时由 APP 自己带 Cookie 调 webui。
+    用 broadcast 型动作：桌面端 ntfy 订阅端（NtfyService 是我们自己的代码）
+    自行解析并渲染按钮，不依赖 ntfy 官方 App 的语义。
+    """
+    aid = str(approval_id or "").strip()
+    if not aid:
+        return []
+    base = {"action": "broadcast",
+            "extras": {"gongsheng_cmd": "approval_decide", "approval_id": aid}}
+    a1 = dict(base); a1["label"] = "批准"; a1["extras"] = dict(base["extras"], decision="approve")
+    a2 = dict(base); a2["label"] = "拒绝"; a2["extras"] = dict(base["extras"], decision="deny")
+    return [a1, a2]
+
+
+def deliver_to_ntfy(topic: str, message: str, *, actions=None) -> bool:
     """把一条主动消息推到 ntfy。**任何异常都不会抛出去。**
 
     三条纪律：
@@ -368,6 +387,10 @@ def deliver_to_ntfy(topic: str, message: str) -> bool:
          本来就已经写进 `pending_actions` 了，不会真的丢
       3. **不泄漏 topic** —— 日志只记成功/失败与状态码，**不记 topic 本身**，
          异常信息也只记类型名
+
+    actions（T6，2026-11-21）：非空时改走 ntfy **JSON 发布通道**（POST 到根路径，
+    body 为 JSON），把按钮数组随消息一起发；订阅端（APK NtfyService）解析
+    actions 渲染「批准/拒绝」按钮。普通文本路径行为完全不变。
 
     返回值只用于留痕，调用方不必关心。
     """
@@ -381,23 +404,37 @@ def deliver_to_ntfy(topic: str, message: str) -> bool:
         import urllib.request
         from urllib.parse import quote
 
-        req = urllib.request.Request(
-            f"{NTFY_URL_BASE}/{quote(topic, safe='')}",
-            # ★ 显式 UTF-8 字节 —— 实测过：PowerShell 那条路会把中文发成乱码，
-            #   Python 这条不会。别改成 str 直传。
-            data=message.encode("utf-8"),
-            headers={
-                "Content-Type": "text/plain; charset=utf-8",
-                # 头只用 ASCII：HTTP 头按 latin-1 编码，中文标题会出错。
-                # 中文正文放 body，那里是 UTF-8，没有问题。
-                "Title": "Companion",
-                "Priority": "default",
-            },
-            method="POST",
-        )
+        if actions:
+            # JSON 发布通道：按钮必须走这里（文本通道无法携带结构化动作）。
+            # 与文本通道同样的三条纪律；标题在 body 里，UTF-8 中文无碍。
+            body = json.dumps({"topic": topic, "message": message,
+                               "title": "Companion", "actions": list(actions)},
+                              ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{NTFY_URL_BASE}/",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        else:
+            req = urllib.request.Request(
+                f"{NTFY_URL_BASE}/{quote(topic, safe='')}",
+                # ★ 显式 UTF-8 字节 —— 实测过：PowerShell 那条路会把中文发成乱码，
+                #   Python 这条不会。别改成 str 直传。
+                data=message.encode("utf-8"),
+                headers={
+                    "Content-Type": "text/plain; charset=utf-8",
+                    # 头只用 ASCII：HTTP 头按 latin-1 编码，中文标题会出错。
+                    # 中文正文放 body，那里是 UTF-8，没有问题。
+                    "Title": "Companion",
+                    "Priority": "default",
+                },
+                method="POST",
+            )
         with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT_S) as resp:
             ok = 200 <= resp.status < 300
-            storage.log_line(f"heartbeat ntfy: ok={ok} status={resp.status}")
+            storage.log_line(f"heartbeat ntfy: ok={ok} status={resp.status} "
+                             f"actions={len(actions) if actions else 0}")
             return ok
     except Exception as exc:                       # noqa: BLE001
         # 可能是 URLError / HTTPError / 代理 / 证书 / DNS —— 类型不可穷举，
@@ -507,6 +544,48 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
         return {**result, "context": context, "run_id": None, "pending_id": None,
                 "dry_run": True, "trigger": trigger}
 
+    # —— B（2026-11-21，老板批准）：主动消息**扩写** ——
+    # 判定（decide）保持零模型（规则便宜、可复现）；唯一一次调用花在
+    # 「决定要说了」之后的扩写上：把规则合成的短意图扩成有内容的详细消息。
+    # 事件驱动低频（每天最多几次），费用可忽略；走 call_model_standalone
+    # （统一记账出口，Phase 11 审计结论），费用不漏记。
+    # 闸门：① NTFY_TOPIC 已配置（推送消费方在）② rules.proactive_expand 未显式关。
+    # 失败/未启用 → 如实退回规则短消息（不阻塞链路、不假装发过）。
+    expanded = False
+    if (not dry_run and result["decision"] == "proactive_message"
+            and (result["message"] or "").strip()
+            and ntfy_topic_from_env()
+            and rules.get("proactive_expand", True)):
+        try:
+            from chat import call_model_standalone
+            from llm import LLMClient
+            from config import load_env, load_settings as _load_settings
+            _env = load_env()
+            _set = _load_settings()
+            _client = LLMClient(api_key=_env.api_key, base_url=_env.base_url,
+                                model=_set.model, temperature=0.7, max_tokens=400)
+            _sys = ("你是鹤辞。此刻你要主动给对方发一条消息。"
+                    "用你的口吻写 2~4 句自然口语：可以围绕给出的由头展开一点点，"
+                    "不要列表、不要解释自己为什么发消息、不要宣称内部状态、"
+                    "不要连续问两个问题；总长不超过 120 字。直接输出消息本身，不要引号。")
+            _usr = (f"由头：{result['reason']}（{result['action']}）\n"
+                    f"想说的核心：{result['message']}\n"
+                    f"关系阶段：{(context.get('relationship') or {}).get('stage')}\n"
+                    f"上次对话：{str(context.get('last_user_text') or '')[:60]}")
+            reply_x = call_model_standalone(
+                _client,
+                [{"role": "system", "content": _sys},
+                 {"role": "user", "content": _usr}],
+                settings=_set, conn=conn, purpose="proactive_expand")
+            _text = (reply_x["reply"].text or "").strip()
+            if _text:
+                result["message"] = _text
+                result["expanded"] = True
+                expanded = True
+        except Exception as exc:  # noqa: BLE001 —— 扩写失败如实退回短消息
+            storage.log_line(f"heartbeat proactive 扩写失败（退回短消息）: "
+                             f"{type(exc).__name__}: {str(exc)[:100]}")
+
     run_id = storage.record_heartbeat_run(
         conn,
         decision=result["decision"],
@@ -520,7 +599,9 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
             "user_model_active": context.get("user_model_active"),
             # Phase B 起新增（放在既有的 JSON context 列里，**不动表结构**）：
             "trigger": trigger,          # 谁触发的：manual / chat / schedule
-            "model_called": False,       # 本阶段心跳**全程不调模型**，显式留痕
+            # 2026-11-21 修订（老板批准）：主动消息扩写启用后，这里如实记
+            "model_called": expanded,
+            "expanded": expanded,
         },
     )
 
@@ -572,6 +653,39 @@ def tick(conn, settings, *, now: datetime | None = None, dry_run: bool = False,
                 storage.log_line(
                     f"heartbeat ntfy: {pending_id} 已推送 → status=pushed"
                 )
+
+        # —— 她主动开口（2026-11-21，老板要求）：把这条消息**物化成真实对话轮次** ——
+        # 此前"主动"只推通知 + 攒进卡片、等用户开口才注入 —— 手机上她永远不会
+        # 先说话。现在：写进最近使用的会话（assistant-only 轮次，接在哈希链上），
+        # 手机打开鹤辞就能在对话里看到她主动说的话；pending 同时标记 delivered
+        # （已说出，下次开口不再重复注入）。零模型调用：话由规则合成，不新增成本。
+        try:
+            _last = storage.last_turn(conn)
+            if _last is not None and (result["message"] or "").strip():
+                # seq 用 MAX(seq)+1（确定性、防撞）——last_turn 按 created_at 排序，
+                # 时间戳异常时返回的可能不是最大 seq，直接 +1 会撞车。
+                _next_seq = int(conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS m FROM conversations"
+                ).fetchone()[0]) + 1
+                _turn = storage.save_turn(
+                    conn,
+                    session_id=_last["session_id"],
+                    seq=_next_seq,
+                    user_text="",
+                    assistant_text=result["message"],
+                    model=(_last["model"] or ""),
+                    persona_name=(_last["persona_name"] or ""),
+                    persona_sha256=(_last["persona_sha256"] or ""),
+                )
+                if pending_id:
+                    storage.mark_pending_delivered(conn, pending_id,
+                                                   _turn.get("turn_id"))
+                storage.log_line(
+                    f"heartbeat proactive 已物化为对话轮次 {_turn.get('turn_id')} "
+                    f"(session {_last['session_id']})")
+        except Exception as exc:  # noqa: BLE001 —— 物化失败不影响推送与意图留痕
+            storage.log_line(f"heartbeat proactive 物化失败: "
+                             f"{type(exc).__name__}: {exc}")
     else:
         storage.log_line(
             f"heartbeat {result['decision']}: {result['reason']}"

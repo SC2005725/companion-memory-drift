@@ -86,17 +86,21 @@ def _notify_approval(ap: dict) -> None:
 
     推不到**绝不挡审批流程**——没配 NTFY_TOPIC 就静默跳过，
     审批单仍在 /api/approvals/list 和看板上可见。审批动作本身走
-    /api/approvals/decide；手机一键批是 webui 的活（档二）。
+    /api/approvals/decide。
+    T6（2026-11-21）：通知带「批准/拒绝」按钮（APK NtfyService 解析渲染），
+    手机一键批由 APP 直接调 webui 代理（decided_by=boss-phone 留痕）。
     """
     try:
-        from heartbeat import deliver_to_ntfy, ntfy_topic_from_env
+        from heartbeat import (build_approval_actions, deliver_to_ntfy,
+                               ntfy_topic_from_env)
         topic = ntfy_topic_from_env()
         if not topic:
             return
         deliver_to_ntfy(topic, (
             f"⏸ 待批准 {ap['approval_id']}：{ap['action']} {ap['target']}\n"
             f"理由：{ap.get('reason') or '-'}\n"
-            f"批准方式：API POST /api/approvals/decide（approval_id + decision）"))
+            f"（点通知上的按钮批准/拒绝，或 webui 审批面板）"),
+            actions=build_approval_actions(ap.get("approval_id")))
     except Exception:  # noqa: BLE001 —— 通知失败不影响主流程
         pass
 
@@ -257,9 +261,9 @@ def latest_user_model(section: str | None = None) -> dict:
 
     ## 两层，别混
 
-    · **profile**（主）：（网名）的个人动态认知模型 3.1，30 节 5883 字。
+    · **profile**（主）：用户的个人动态认知模型 3.1，30 节 5883 字。
       来自 `user_model/songci-cognition-*.json`（由 `import_user_model.py` 从 docx 导入）。
-    · **facts**（辅）：`user_model/model_vNNN.json` 里那几条零散事实（我叫（网名）、
+    · **facts**（辅）：`user_model/model_vNNN.json` 里那几条零散事实（我叫用户、
       晚上才有精神……），是系统自动抓的，会随对话变。
 
     2026-11-06 调整：**以 profile 为主**。之前只返回 facts，那不是"用户模型"，
@@ -612,6 +616,11 @@ class Handler(BaseHTTPRequestHandler):
                     "cursor": core.latest_cursor(conn),
                     "events": [dict(r) for r in rows],
                 })
+            elif route == "/api/tasks/pool":
+                # 任务池公共栏（2026-11-21，Muse 设计）：所有席位可读
+                self._json(200, {"ok": True,
+                                 "tasks": core.pool_list(
+                                     conn, limit=int(q.get("limit") or 50))})
             elif route.startswith("/api/tasks/"):
                 tid = route[len("/api/tasks/"):]
                 self._json(200, {"ok": True, **core.get_task(conn, tid)})
@@ -808,6 +817,10 @@ class Handler(BaseHTTPRequestHandler):
                     max_rounds=int(payload.get("max_rounds") or 3),
                     client_request_id=payload.get("client_request_id"),
                     risk=payload.get("risk"),
+                    # 任务池（2026-11-21，Muse 设计）：to_instance="pool" 挂公共栏
+                    claim_deadline_seconds=payload.get("claim_deadline_seconds"),
+                    fallback_to_pool=bool(payload.get("fallback_to_pool") or False),
+                    fallback_after_seconds=payload.get("fallback_after_seconds"),
                 )
                 self._json(200, {"ok": True, "task_id": t, "created": created,
                                  "status": "SENT"})
@@ -822,6 +835,35 @@ class Handler(BaseHTTPRequestHandler):
                     note=payload.get("note"),
                     result=payload.get("result"),
                 )
+                self._json(200, {"ok": True, **out})
+                return
+
+            # --- 任务池（2026-11-21，Muse 设计/老板拍板）------------------------
+            if route.startswith("/api/tasks/") and route.endswith("/claim"):
+                tid = route[len("/api/tasks/"):-len("/claim")]
+                out = core.claim_task(conn, tid,
+                                      instance_id=str(payload.get("instance_id") or ""))
+                self._json(200, {"ok": True, **out})
+                return
+            if route.startswith("/api/tasks/") and route.endswith("/release"):
+                tid = route[len("/api/tasks/"):-len("/release")]
+                out = core.release_task(conn, tid,
+                                        instance_id=str(payload.get("instance_id") or ""),
+                                        reason=str(payload.get("reason") or ""))
+                self._json(200, {"ok": True, **out})
+                return
+            if route.startswith("/api/tasks/") and route.endswith("/assign"):
+                tid = route[len("/api/tasks/"):-len("/assign")]
+                out = core.assign_task(conn, tid,
+                                       to_instance=str(payload.get("to_instance") or ""),
+                                       actor_instance=str(payload.get("instance_id") or ""))
+                self._json(200, {"ok": True, **out})
+                return
+            if route.startswith("/api/tasks/") and route.endswith("/pool/rearm"):
+                tid = route[len("/api/tasks/"):-len("/pool/rearm")]
+                out = core.pool_rearm(conn, tid,
+                                      extra_seconds=int(payload.get("extra_seconds") or 0),
+                                      actor_instance=str(payload.get("instance_id") or ""))
                 self._json(200, {"ok": True, **out})
                 return
 
@@ -959,6 +1001,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             self._err(404, f"没有这个接口：POST {route}")
+        except core.TaskClaimConflict as exc:
+            self._err(409, str(exc))   # 池任务已被其他席位认领
         except (ValueError, sqlite3.Error) as exc:
             self._err(400, str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -1142,15 +1186,28 @@ def _start_inbox_worker(interval: int = 60) -> None:
                 try:
                     # 先把本轮要通知的 SENT 任务抓出来（签收前的快照），
                     # 再让 task_patrol 干活——通知与签收用同一份名单，不重不漏。
+                    # 池任务不进这份名单：它等真实认领，不自动签收也不催收件席。
                     rows = [dict(r) for r in conn.execute(
                         "SELECT task_id, to_instance, risk, title, created_at "
-                        "FROM tasks WHERE status='SENT' ORDER BY created_at"
+                        "FROM tasks WHERE status='SENT' AND to_instance != 'pool' "
+                        "ORDER BY created_at"
                     ).fetchall()]
                     pat = core.task_patrol(conn)
                     if pat["received"] or pat["accepted"]:
                         conn.commit()
                 finally:
                     conn.close()
+                # 任务池巡检（2026-11-21）：指定单超时转池 + 池单超时发老板选项事件。
+                # 失败不拖垮巡检本体。
+                try:
+                    _pool_conn = core.connect()
+                    try:
+                        core.pool_sweep(_pool_conn)
+                    finally:
+                        _pool_conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[任务池] sweep 失败（已忽略）："
+                          f"{type(exc).__name__}: {str(exc)[:80]}")
                 # 中枢制调度（2026-11-08）：签收后的 ACCEPTED 单按规则表执行。
                 # v2：失败落库（task_events+effect）、done 静默落账（降噪——
                 # 只有对外类和异常才推手机）、对外动作走 effects 队列。
@@ -1264,6 +1321,16 @@ def main(argv=None) -> int:
     core.init_schema(conn)
     core.ensure_subject(conn)
     conn.close()
+
+    # fs 白名单目录（2026-11-21）：settings.tools.fs_extra_write_dirs —— 老板
+    # 显式授权的外部可写目录（默认空 = 项目 ROOT 内）。校验逻辑在 core_fs 不变。
+    try:
+        from config import load_settings as _load_settings
+        import core_fs as _core_fs
+        _core_fs.set_extra_write_roots(
+            ((_load_settings().tools or {}).get("fs_extra_write_dirs") or []))
+    except Exception as exc:  # noqa: BLE001 — 白名单加载失败不阻断启动
+        print(f"[警告] fs 白名单加载失败：{type(exc).__name__}: {exc}")
 
     if args.consume_interval > 0:
         _start_memory_worker(args.consume_interval)

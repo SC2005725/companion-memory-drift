@@ -99,8 +99,11 @@ def _ensure_backend(token: str) -> subprocess.Popen | None:
         return None
     exe = (sys.executable.replace("python.exe", "pythonw.exe")
            if sys.executable.endswith("python.exe") else sys.executable)
+    # 2026-11-21：加 --host 0.0.0.0 —— 手机 APK/局域网直连需要（webui 默认只绑
+    # 127.0.0.1，手机连 192.168.x.x 会被直接拒绝）。安全边界不靠绑定靠四道校验：
+    # 令牌必查 + Host/Origin 白名单仅本机 IP 与 tailnet（webui.py:_host_ok）。
     proc = subprocess.Popen(
-        [exe, "src/webui.py", "--port", str(WEBUI_PORT), "--no-open"],
+        [exe, "src/webui.py", "--port", str(WEBUI_PORT), "--host", "0.0.0.0", "--no-open"],
         cwd=str(ROOT), creationflags=subprocess.CREATE_NO_WINDOW)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:

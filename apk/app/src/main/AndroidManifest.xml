@@ -1,22 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 局域网 http 直连需要明文流量（webui 在局域网就是 http）；
+         令牌四道校验仍然生效，APK-2 走 tailscale serve 的 https 后可收回此开关 -->
     <application
-        android:label="共生遥控器"
-        android:icon="@mipmap/ic_launcher"
-        android:theme="@style/Theme.Gongsheng"
-        android:usesCleartextTraffic="false">
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".NtfyService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- T6（2026-11-21）：审批通知「批准/拒绝」按钮的裁决执行者；
+             exported=false 只有本 APP 的 PendingIntent 能触达 -->
+        <receiver
+            android:name=".ApprovalReceiver"
+            android:exported="false" />
     </application>
 </manifest>

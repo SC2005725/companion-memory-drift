@@ -741,6 +741,7 @@ def send_once(
     full_memory_version: bool = False,
     use_relationship: bool = True,
     user_image: str | None = None,
+    auto_consolidate: bool = True,
 ) -> dict:
     """执行一次完整往返。返回本轮落盘结果摘要。
 
@@ -1117,7 +1118,9 @@ def send_once(
 
     # Memory V1：批量自动整理。放在落盘**之后**，确保本轮对话已被计入；
     # 失败不影响本轮返回（maybe_auto_consolidate 内部已吞异常）。
-    auto_result = maybe_auto_consolidate(session, echo=echo)
+    # 2026-11-21：auto_consolidate=False 供 webui 后台线程代替执行（整理一轮
+    # 31-45s，同步跑会把回复扣住）—— 跳过时 auto_result=None，与「未触发」同形。
+    auto_result = maybe_auto_consolidate(session, echo=echo) if auto_consolidate else None
 
     echo(reply.text)
     return {

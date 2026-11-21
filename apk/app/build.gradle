@@ -1,26 +1,22 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
 }
 
 android {
-    namespace 'com.gongsheng.remote'
+    namespace 'ai.gongsheng.companion'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.gongsheng.remote"
-        minSdk 26
+        applicationId "ai.gongsheng.companion"
+        minSdk 24          // Android 7.0+，覆盖绝大多数设备
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 6
+        versionName "0.6-approval-btn"
     }
 
-    // 自用分发：debug 签名即可安装（CI 的 debug.keystore 每次生成，
-    // 升级安装请卸载旧版再装新版——服务端数据在电脑侧，不受影响）。
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
         }
     }
 
@@ -28,9 +24,8 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = '17' }
 }
 
-dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-}
+// 刻意零第三方依赖：WebView / Cookie / UI 全部用框架 API。
+// APK-2 的 libtailscale（gomobile aar）是唯一计划中的增量。
+dependencies {}

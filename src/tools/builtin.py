@@ -21,8 +21,11 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -338,6 +341,342 @@ def make_now() -> Tool:
     return Tool(
         name="now",
         description="查询当前本地日期和时间（含时段：早上/中午/下午/晚上/深夜）。无参数。",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        execute=execute,
+        permission="read",
+    )
+
+
+def make_dispatch_task(core_db_path: Path) -> Tool:
+    """派单工具（2026-11-21）：鹤辞把任务正式派给其他执行实例。
+
+    ## 这是什么
+
+    用户在聊天里说「帮我把 xx 文件拷到 yy」「查一下本地 xx」时，鹤辞此前只能
+    动嘴转述 —— 这个工具让她把任务**写入主体协作账本**（companion_core），
+    由被点名的执行实例接单执行。只创建、不执行：鹤辞是派单方，不是执行方。
+
+    ## 实例与通道（沿用派单说明-20261108 的三通道约定）
+
+    | target | 执行实例 | 通道 | 延迟 |
+    |---|---|---|---|
+    | core | heci_001_dsh（core_agent/收件巡检） | 结构化指令（context.action） | ≤3 分钟 |
+    | dsh | heci_001_dsh（dsh-superagent） | 自然语言任务 | ≤20 分钟 |
+    | zcode | heci_001_zcode（ZCode 席位巡查） | 调研/代码/报告 | 看巡查周期 |
+
+    ## 安全边界（如实说明）
+
+    - 这里只**创建**任务。执行在接收端，且接收端有完整闸门：
+      危险指令硬闸（dangerous_reason → 审批单 + ntfy 推手机 + 任务 WAITING）、
+      租约 fencing、60s 收件巡检。
+    - `risk` 必填（fail closed）：low=只读/查询/报告；medium=新建文件等可撤销操作；
+      high=删除/改配置/不可逆 —— high 即使创建成功也会被接收端闸门拦下等老板审批。
+    - 每次派单落进任务账本（task_events），事后可查她派过什么。
+    """
+    def execute(args: dict) -> ToolResult:
+        target = str(args.get("target") or "").strip().lower()
+        title = str(args.get("title") or "").strip()
+        detail = str(args.get("detail") or "").strip()
+        risk = str(args.get("risk") or "").strip().lower()
+        action = args.get("action") if isinstance(args.get("action"), dict) else None
+
+        if target not in ("core", "dsh", "zcode", "muse"):
+            return ToolResult(
+                False,
+                error="target 必须是 core（结构化指令）/ dsh（自然语言）/ zcode（调研代码）"
+                      "/ muse（云端实例）之一",
+                error_kind="denied",
+            )
+        if not title:
+            return ToolResult(False, error="title 不能为空（一句话说清要做什么）",
+                              error_kind="error")
+        if risk not in ("low", "medium", "high"):
+            return ToolResult(
+                False,
+                error=("risk 必须标注：low（只读/查询/报告）/ medium（新建文件等"
+                       "可撤销操作）/ high（删除/改配置/不可逆——会被审批拦下）"),
+                error_kind="denied",
+            )
+        if target == "core" and action is None:
+            return ToolResult(
+                False,
+                error=("core 通道只执行结构化指令：请提供 action="
+                       '{"action": "write_new_file", "path": "...", "content": "..."} '
+                       '或 {"action": "report_status"}；自然语言任务请用 target=dsh'),
+                error_kind="error",
+            )
+        if action is not None and str(action.get("action") or "") not in (
+                "write_new_file", "report_status"):
+            return ToolResult(
+                False,
+                error="action 只支持 write_new_file / report_status（其他动作走 target=dsh）",
+                error_kind="denied",
+            )
+        if action is not None and str(action.get("action")) == "write_new_file" \
+                and risk == "low":
+            return ToolResult(
+                False,
+                error="写文件至少标 medium（low 只允许只读/汇报）",
+                error_kind="denied",
+            )
+
+        to_instance = {"core": "heci_001_dsh", "dsh": "heci_001_dsh",
+                       "zcode": "heci_001_zcode",
+                       "muse": "heci_001_muse"}[target]
+        # ⚠️ 协议形状（plan_for/core_api 巡检的契约）：context["action"] 是**字符串**
+        # 动作名，path/content 是同级键 —— 不能嵌套成字典，否则 str(dict) 永远
+        # 匹配不上动作名，任务会留在 ACCEPTED 等人（2026-11-21 实测踩坑）。
+        context = {"target": target,
+                   "channel": "structured" if target == "core" else "nl",
+                   "origin": "chat_tool"}
+        if action is not None:
+            context["action"] = str(action.get("action"))
+            for _k, _v in action.items():
+                if _k != "action":
+                    context[_k] = _v
+
+        try:
+            import companion_core as core
+            conn = core.connect(core_db_path)
+            try:
+                task_id, created = core.create_task(
+                    conn,
+                    from_instance="heci_001",           # 鹤辞本体派单
+                    to_instance=to_instance,
+                    title=title[:80],
+                    detail=detail[:2000] or None,
+                    context=context,
+                    risk=risk,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 —— 派单失败要如实告诉模型
+            return ToolResult(False,
+                              error=f"派单失败：{type(exc).__name__}: {exc}",
+                              error_kind="error")
+
+        note = ""
+        if risk == "high":
+            note = "——高危任务会先弹审批单推老板手机，批准才会执行。"
+        channel = "结构化指令（≤3 分钟）" if target == "core" else \
+            ("自然语言（≤20 分钟）" if target == "dsh" else "ZCode 席位巡查")
+        return ToolResult(
+            True,
+            output=f"已派单 {task_id}（{'新建' if created else '重复请求已幂等合并'}，"
+                   f"目标 {target}，风险 {risk}，通道：{channel}）{note}",
+        )
+
+    return Tool(
+        name="dispatch_task",
+        description=(
+            "把任务派给其他执行实例（本地巡查器/dsh/ZCode），用于文件操作、本机查询、"
+            "调研写报告等自己做不到的事。参数：target（core=结构化指令/dsh=自然语言/"
+            "zcode=调研代码，必填）、title（一句话任务描述，必填）、detail（任务细节，可选）、"
+            "risk（low/medium/high，必填——只读报 low，写文件标 medium，删除类标 high）、"
+            "action（仅 target=core 时提供：{action:'write_new_file',path,content} 或 "
+            "{action:'report_status'}）。高危操作会先弹审批等老板批准。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": "core/dsh/zcode 之一"},
+                "title": {"type": "string", "description": "一句话任务描述"},
+                "detail": {"type": "string", "description": "任务细节（可空）"},
+                "risk": {"type": "string",
+                         "description": "low/medium/high，必须如实标注"},
+                "action": {
+                    "type": "object",
+                    "description": "仅 target=core：结构化指令载荷",
+                },
+            },
+            "required": ["target", "title", "risk"],
+        },
+        execute=execute,
+        permission="write",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 自主行动能力批（2026-11-21）：自查 / 联网搜索 / 抓网页
+# 均为只读档；网络工具走纯标准库（urllib + re），不新增依赖。
+# ---------------------------------------------------------------------------
+
+def _parse_bing_html(html: str) -> list[dict]:
+    """从 cn.bing.com 结果页提取 [{title, url, snippet}]。Bing 改版会返回空列表。"""
+    out: list[dict] = []
+    for block in re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.S):
+        m = re.search(r'<h2[^>]*><a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        url = m.group(1)
+        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        snip = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        text = re.sub(r"<[^>]+>", "", snip.group(1)).strip() if snip else ""
+        out.append({"title": title[:120], "url": url[:300], "snippet": text[:200]})
+    return out
+
+
+def make_web_search(fetcher=None) -> Tool:
+    """联网搜索（2026-11-21）：cn.bing.com HTML 解析，纯标准库实现。
+
+    渠道横评（实测）：cn.bing.com 200 可达可解析 ✓；baidu 200 但反爬重；
+    duckduckgo 000 不可达 ✗。modsearch 是 DSH 会话内能力、非系统 CLI ✗。
+    引擎改版 → 如实报错，不假装有结果。
+    """
+    import urllib.parse as _up
+
+    def execute(args: dict) -> ToolResult:
+        q = str(args.get("query") or "").strip()
+        if not q:
+            return ToolResult(False, error="query 不能为空", error_kind="error")
+        if len(q) > 120:
+            return ToolResult(False, error="query 过长（上限 120 字）", error_kind="error")
+        url = ("https://cn.bing.com/search?q=" + _up.quote(q) + "&count=10")
+        try:
+            if fetcher is not None:
+                html = fetcher(url)
+            else:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36"})
+                html = urllib.request.urlopen(req, timeout=15).read().decode(
+                    "utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001 —— 网络错误如实上报
+            return ToolResult(False,
+                              error=f"搜索失败：{type(exc).__name__}: {str(exc)[:120]}",
+                              error_kind="error")
+        results = _parse_bing_html(html)
+        if not results:
+            return ToolResult(False,
+                              error="搜索引擎返回了无法解析的结果（可能改版或无结果）",
+                              error_kind="error")
+        lines = [f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}"
+                 for i, r in enumerate(results[:8], start=1)]
+        return ToolResult(True, output="\n".join(lines))
+
+    return Tool(
+        name="web_search",
+        description="联网搜索（Bing）。参数：query（搜索词，必填，≤120 字）。"
+                    "返回标题/链接/摘要列表。用于查资料、核实事实、找参考。",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "搜索词"}},
+            "required": ["query"],
+        },
+        execute=execute,
+        permission="read",
+    )
+
+
+def make_web_fetch(fetcher=None) -> Tool:
+    """抓取网页正文（2026-11-21）：GET + 去标签转文本，纯标准库。
+
+    边界：仅 http/https；响应 ≤2MB；正文截 6000 字；超时 15s。
+    内网地址（127.0.0.1/内网 IP）不放行 —— 防止用她去探测本机服务面。
+    """
+    import urllib.parse as _up
+
+    _BLOCKED_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "169.254.",
+                      "192.168.", "10.", "172.")
+
+    def execute(args: dict) -> ToolResult:
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return ToolResult(False, error="url 不能为空", error_kind="error")
+        scheme = _up.urlparse(url).scheme.lower()
+        host = (_up.urlparse(url).hostname or "").lower()
+        if scheme not in ("http", "https"):
+            return ToolResult(False, error="只支持 http/https", error_kind="denied")
+        if any(host == b or host.startswith(b) for b in
+               ("127.0.0.1", "localhost", "0.0.0.0", "169.254.", "192.168.", "10.")):
+            return ToolResult(False, error="内网地址不抓取", error_kind="denied")
+        try:
+            if fetcher is not None:
+                html = fetcher(url)
+            else:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36"})
+                raw = urllib.request.urlopen(req, timeout=15).read()
+                if len(raw) > 2_000_000:
+                    return ToolResult(False, error="页面过大（>2MB）", error_kind="error")
+                html = raw.decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False,
+                              error=f"抓取失败：{type(exc).__name__}: {str(exc)[:120]}",
+                              error_kind="error")
+        # 去掉脚本/样式/标签，压空白
+        html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 6000:
+            text = text[:6000] + "…（已截断）"
+        return ToolResult(True, output=text or "（页面无可提取正文）")
+
+    return Tool(
+        name="web_fetch",
+        description="抓取一个网页并提取正文文本（去标签，截 6000 字）。"
+                    "参数：url（必填，http/https）。与 web_search 配合：先搜后读。",
+        input_schema={
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "网页地址"}},
+            "required": ["url"],
+        },
+        execute=execute,
+        permission="read",
+    )
+
+
+def make_self_check(settings_holder) -> Tool:
+    """软件自查（2026-11-21）：鹤辞随时自报系统状态，只读、零网络。
+
+    聚合：记忆版本/条目、关系阶段、情绪主导、心跳跑批、待兑现意图、
+    对话/事件/费用计数 —— 与 webui 状态页同一数据源口径。
+    """
+    import urllib.parse as _up
+
+    def execute(args: dict) -> ToolResult:
+        try:
+            import storage as _storage
+            import memory as _memory
+            import relationship as _rel
+            import emotion as _emotion
+            conn = _storage.connect()
+            try:
+                lines: list[str] = []
+                mv = _memory.load_latest()
+                lines.append(f"记忆：{mv.version if mv else '无'} "
+                             f"（{len(mv.items) if mv else 0} 条）")
+                st = _rel.current_state(conn, (getattr(settings_holder, 'relationship', None) or {}))
+                lines.append(f"关系：{st.get('stage')} 信任 {st.get('trust')} "
+                             f"亲密 {st.get('closeness')}")
+                emo = _emotion.load_state(decay=True)
+                if emo and emo.emotions and any(v > 0 for v in emo.emotions.values()):
+                    dom = emo.dominant() or ""
+                    lines.append(f"情绪：{dom}（强度 {emo.emotions.get(dom, 0):.1f}）")
+                else:
+                    lines.append("情绪：待机（还没有记录）")
+                hb = _storage.list_heartbeat_runs(conn, limit=1)
+                pend = _storage.list_pending_actions(conn, status="pending")
+                lines.append(f"心跳：累计 {conn.execute('SELECT COUNT(*) c FROM heartbeat_runs').fetchone()['c']} 次"
+                             f"{'，最近 ' + (hb[0]['created_at_local'] or '')[:16] if hb else ''}")
+                lines.append(f"待兑现主动意图：{len(pend)} 条")
+                stats = _storage.stats(conn)
+                lines.append(f"对话 {stats.get('turns', 0)} 轮 · 事件 {stats.get('events', 0)} 条 · "
+                             f"API {stats.get('api_calls', 0)} 次")
+                return ToolResult(True, output="\n".join(lines))
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False,
+                              error=f"自查失败：{type(exc).__name__}: {str(exc)[:120]}",
+                              error_kind="error")
+
+    return Tool(
+        name="self_check",
+        description="软件自查：汇报你（鹤辞）当前的系统状态——记忆版本、关系阶段、"
+                    "情绪、心跳、待兑现意图、对话与费用计数。无参数。",
         input_schema={"type": "object", "properties": {}, "required": []},
         execute=execute,
         permission="read",

@@ -33,7 +33,9 @@ def build_registry(settings, *, root=None):
 
     cfg = getattr(settings, "tools", None) or {}
     allowed = tuple(cfg.get("allowed_permissions") or ("read",))
-    enabled = set(cfg.get("enabled") or ["read_file", "run_python", "take_note", "now"])
+    enabled = set(cfg.get("enabled")
+                  or ["read_file", "run_python", "take_note", "now", "dispatch_task",
+                      "self_check", "web_search", "web_fetch"])
     base_root = Path(root or paths_mod.ROOT).resolve()
 
     reg = ToolRegistry(allowed_permissions=allowed, allowed_root=base_root)
@@ -44,6 +46,13 @@ def build_registry(settings, *, root=None):
         # 「现在几点」—— 用户明确要求过（「你可以接入时间吗」），
         # 且中午说「晚安」的事故就是缺它。零依赖、无副作用。
         builtin.make_now(),
+        # 派单（2026-11-21）：鹤辞 → 其他执行实例（core/dsh/zcode/muse）。
+        # 这里只创建任务；执行与危险拦截都在接收端（硬闸 + 租约 + 巡检）。
+        builtin.make_dispatch_task(paths_mod.ROOT / "core" / "companion_core.db"),
+        # 自主行动批（2026-11-21）：自查 / 联网搜索 / 抓网页 —— 均只读档。
+        builtin.make_self_check(settings),
+        builtin.make_web_search(),
+        builtin.make_web_fetch(),
     ]
     for tool in candidates:
         if tool.name in enabled:

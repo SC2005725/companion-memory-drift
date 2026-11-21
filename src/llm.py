@@ -198,6 +198,23 @@ class LLMClient:
         except ImportError as exc:  # pragma: no cover
             raise LLMError("缺少依赖 openai，请先执行：pip install -r requirements.txt") from exc
 
+        # 2026-11-21 事故：Windows 系统代理指向一个**没有运行的**本地代理端口
+        # （注册表 ProxyServer=127.0.0.1:7890，代理软件未开），openai 客户端
+        # 走 getproxies 拿到它 → 每次 LLM 调用 10061 连接拒绝。
+        # 对策：按 LLM 端点的主机名精确绕过代理（DeepSeek 国内直连本就更稳），
+        # 只改本进程的 NO_PROXY 环境变量，不动系统设置、不影响其他应用。
+        # base_url 将来换成需要代理的境外端点时，这里会自动跟着换成新主机名。
+        import os as _os
+        from urllib.parse import urlparse as _urlparse
+        _llm_host = (_urlparse(base_url).hostname or "").lower()
+        if _llm_host:
+            _current = _os.environ.get("NO_PROXY", _os.environ.get("no_proxy", ""))
+            _parts = [p.strip().lower() for p in _current.split(",") if p.strip()]
+            if "*" not in _parts and _llm_host not in _parts:
+                _parts.append(_llm_host)
+                _os.environ["NO_PROXY"] = ",".join(_parts)
+                _os.environ["no_proxy"] = ",".join(_parts)
+
         self._client = OpenAI(api_key=api_key, base_url=base_url)
         # 供 dryrun / 统计用：记录发生过多少次空回复重试
         self.empty_retries = 0

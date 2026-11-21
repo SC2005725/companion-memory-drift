@@ -266,10 +266,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     CREATE TABLE IF NOT EXISTS 对已存在的表无能为力 —— 老 core.db 的
     tasks 没有 risk 列，必须 ALTER 补上（2026-11-08，CE-3 步2）。
+    2026-11-21：任务池七列（Muse 设计/老板拍板）——全部可空/带默认，
+    加列即可用，零数据回填，对既有指定单零影响。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
     if "risk" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN risk TEXT")
+    pool_cols = {
+        "claimed_by":            "TEXT",
+        "claim_count":           "INTEGER NOT NULL DEFAULT 0",
+        "release_count":         "INTEGER NOT NULL DEFAULT 0",
+        "release_reason":        "TEXT",
+        "pool_entered_at":       "TEXT",
+        "pool_deadline_at":      "TEXT",
+        "pool_timeout_notified": "INTEGER NOT NULL DEFAULT 0",
+        "fallback_to_pool":      "INTEGER NOT NULL DEFAULT 0",
+        "fallback_after_seconds": "INTEGER",
+    }
+    for name, decl in pool_cols.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
 
 
 def ensure_subject(
@@ -652,6 +668,30 @@ TASK_STATES = (
 )
 TASK_FINAL = {"COMPLETED", "REJECTED", "FAILED", "CANCELLED"}
 
+# ---------------------------------------------------------------------------
+# 任务池（2026-11-21，Muse 设计 / 老板拍板）：to_instance="pool" = 挂公共栏待认领。
+# 防重复执行的关键在 core 内部原子操作（单条 UPDATE 带状态守卫 + rowcount 判定），
+# 各席位轮询商量做不到这点。指定派单完全保留，池只是多一种寻址方式。
+# ---------------------------------------------------------------------------
+POOL_TO = "pool"                                   # 池任务的 to_instance 值
+POOL_CLAIM_DEADLINE_SECONDS = 30 * 60              # claim_deadline 默认 30 分钟
+POOL_ONLINE_SECONDS = 180                          # 在线判定：3 个心跳周期（60s×3）
+# 超时通知里的席位优先名单（§四②，可配置点）：第一位放智谱 ZCode。
+POOL_SEAT_PRIORITY = ("heci_001_zcode", "heci_001_dsh", "heci_001_muse")
+# 释放回池允许的状态（认领后、终结前）。SENT 本来就在池里，不在其列。
+_POOL_RELEASEABLE = ("RECEIVED", "REVIEWING", "NEGOTIATING",
+                     "ACCEPTED", "RUNNING", "WAITING")
+
+
+class TaskClaimConflict(Exception):
+    """池任务认领冲突：已被其他席位认领（HTTP 409）。属性 claimed_by 带认领者。"""
+
+    def __init__(self, task_id: str, claimed_by: str | None):
+        super().__init__(
+            f"任务 {task_id} 已被 {claimed_by or '其他席位'} 认领（409）")
+        self.task_id = task_id
+        self.claimed_by = claimed_by
+
 # 每个动作：谁能做、从哪些状态、到哪个状态
 _ACTIONS = {
     "receive":  ("to",   {"SENT"},                                   "RECEIVED"),
@@ -685,11 +725,20 @@ def create_task(
     max_rounds: int = 3,
     client_request_id: str | None = None,
     risk: str | None = None,
+    claim_deadline_seconds: int | None = None,
+    fallback_to_pool: bool = False,
+    fallback_after_seconds: int | None = None,
 ) -> tuple[str, bool]:
     """发起一个协作请求。返回 (task_id, 是否新建)。
 
     risk（2026-11-08，CE-3 步2）：发送方给任务标风险档 low/medium/high。
     **不标 = fail closed** —— 巡检只签收不接单，接不接由实例自己判断。
+
+    任务池（2026-11-21，Muse 设计/老板拍板）：
+      to_instance="pool" → 挂公共栏待认领，任一席位 claim 后进现有状态机；
+      claim_deadline_seconds 超时无人认领 → 发超时事件给老板选派（§五）。
+    指定派单可带 fallback_to_pool=True + fallback_after_seconds：目标席位
+    超时没 accept → 自动转入公共栏（验收标准 #2）。
     """
     if risk is not None and str(risk).lower() not in ("low", "medium", "high"):
         raise ValueError(f"risk 只能是 low/medium/high 或不标（fail closed），"
@@ -700,11 +749,19 @@ def create_task(
     if row is None:
         raise ValueError(f"未登记的实例：{from_instance}")
     subject_id = row["subject_id"]
-    if conn.execute("SELECT 1 FROM instances WHERE instance_id=?",
-                    (to_instance,)).fetchone() is None:
+
+    is_pool = (to_instance == POOL_TO)
+    if not is_pool and conn.execute(
+            "SELECT 1 FROM instances WHERE instance_id=?",
+            (to_instance,)).fetchone() is None:
         raise ValueError(f"对方实例不存在：{to_instance}")
     if from_instance == to_instance:
         raise ValueError("不能给自己发协作请求")
+    if is_pool and (fallback_to_pool or fallback_after_seconds is not None):
+        raise ValueError("池任务本身就在池里，不需要 fallback_to_pool")
+    if fallback_to_pool and fallback_after_seconds is not None \
+            and int(fallback_after_seconds) <= 0:
+        raise ValueError("fallback_after_seconds 必须为正数")
 
     if client_request_id:
         dup = conn.execute(
@@ -716,20 +773,40 @@ def create_task(
 
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     now = _now()
+    pool_deadline = (_deadline_from(
+        now, int(claim_deadline_seconds or POOL_CLAIM_DEADLINE_SECONDS))
+        if is_pool else None)
     conn.execute(
         "INSERT INTO tasks (task_id, subject_id, from_instance, to_instance, status, "
         "title, detail, context, created_at, updated_at, rounds, max_rounds, "
-        "risk, client_request_id) VALUES (?,?,?,?,'SENT',?,?,?,?,?,0,?,?,?)",
+        "risk, client_request_id, claimed_by, claim_count, release_count, "
+        "pool_entered_at, pool_deadline_at, pool_timeout_notified, "
+        "fallback_to_pool, fallback_after_seconds) "
+        "VALUES (?,?,?,?,'SENT',?,?,?,?,?,0,?,?,?,NULL,0,0,?,?,0,?,?)",
         (task_id, subject_id, from_instance, to_instance, title, detail,
          json.dumps(context or {}, ensure_ascii=False), now, now,
          max(1, int(max_rounds)),
-         (str(risk).lower() if risk else None), client_request_id),
+         (str(risk).lower() if risk else None), client_request_id,
+         now if is_pool else None, pool_deadline,
+         1 if fallback_to_pool else 0,
+         int(fallback_after_seconds) if fallback_after_seconds is not None else None),
     )
     conn.execute(
         "INSERT INTO task_events (task_id, at, actor_instance, action, note, status_after) "
         "VALUES (?,?,?,?,?,'SENT')",
-        (task_id, now, from_instance, "create", title[:200]),
+        (task_id, now, from_instance,
+         "create" + ("_pool" if is_pool else ""),
+         (title[:200] + ("（挂池待认领）" if is_pool else ""))),
     )
+    if is_pool:
+        # 建池单事件进主体事件流（§六：各端靠事件同步感知状态）
+        env = conn.execute("SELECT environment FROM instances WHERE instance_id=?",
+                           (from_instance,)).fetchone()
+        append_event(conn, instance_id=from_instance, event_type="pool_task_created",
+                     content=f"池任务 {task_id}：{title}（{from_instance} 挂出，"
+                             f"认领期限 {POOL_CLAIM_DEADLINE_SECONDS // 60} 分钟）",
+                     source_environment=(env["environment"] if env else "unknown"),
+                     task_id=task_id, dedup_key=f"{task_id}:pool_created")
     conn.commit()
     return task_id, True
 
@@ -827,7 +904,8 @@ def task_patrol(conn: sqlite3.Connection, *,
     """
     rows = conn.execute(
         "SELECT task_id, to_instance, risk, title FROM tasks "
-        "WHERE status='SENT' ORDER BY created_at").fetchall()
+        "WHERE status='SENT' AND to_instance != 'pool' ORDER BY created_at"
+    ).fetchall()
     received: list[str] = []
     accepted: list[str] = []
     for t in rows:
@@ -876,6 +954,306 @@ def list_tasks(
     sql += " ORDER BY created_at DESC LIMIT ?"
     args.append(max(1, min(int(limit), 200)))
     return conn.execute(sql, args).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# 任务池（2026-11-21，Muse 设计 / 老板拍板）：
+#   池=公共栏，认领=原子锁。防重复执行只靠 core 内部单条带守卫的 UPDATE
+#   （WHERE status='SENT' AND to_instance='pool'）+ rowcount 判定——
+#   两个席位同时抢，只有一个 rowcount=1，另一个拿到当前状态 → 409。
+# ---------------------------------------------------------------------------
+
+def _deadline_from(now_iso: str, seconds: int) -> str:
+    from datetime import timedelta
+    return (datetime.fromisoformat(now_iso)
+            + timedelta(seconds=int(seconds))).isoformat()
+
+
+def _pool_event(conn: sqlite3.Connection, task_id: str, actor_instance: str,
+                event_type: str, content: str, dedup_suffix: str) -> None:
+    """池生命周期事件进主体事件流（append-only，幂等）。同步给各端感知状态。"""
+    env = conn.execute("SELECT environment FROM instances WHERE instance_id=?",
+                       (actor_instance,)).fetchone()
+    append_event(conn, instance_id=actor_instance, event_type=event_type,
+                 content=content,
+                 source_environment=(env["environment"] if env else "unknown"),
+                 task_id=task_id, dedup_key=f"{task_id}:{dedup_suffix}")
+
+
+def claim_task(conn: sqlite3.Connection, task_id: str, *,
+               instance_id: str) -> dict:
+    """原子认领池任务。第二个 claim 必须拿到冲突（TaskClaimConflict → 409）。
+
+    单事务两步：UPDATE 带状态守卫（赢者 rowcount=1）→ 写事件。claim 同时
+    把 to_instance 指向认领者——后半段（accept/result/租约/审批）全部
+    沿用现有逻辑，一行业务代码都不用改。
+    """
+    row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"任务不存在：{task_id}")
+    if row["status"] in TASK_FINAL:
+        raise ValueError(f"任务已终结（{row['status']}），不能认领")
+    if row["to_instance"] != POOL_TO:
+        if row["claimed_by"]:
+            # 池单已被认领（认领后 to_instance 变认领者）→ 必须 409 而非 400。
+            # 判据是 claimed_by，不是 to_instance——后者在认领瞬间就变了。
+            raise TaskClaimConflict(task_id, row["claimed_by"])
+        raise ValueError(f"非池任务（to_instance={row['to_instance']}），"
+                         f"走指定派单流程，不走认领")
+    if conn.execute("SELECT 1 FROM instances WHERE instance_id=?",
+                    (instance_id,)).fetchone() is None:
+        raise ValueError(f"未登记的实例：{instance_id}")
+
+    now = _now()
+    cur = conn.execute(
+        "UPDATE tasks SET to_instance=?, claimed_by=?, status='RECEIVED', "
+        "updated_at=?, claim_count=claim_count+1 "
+        "WHERE task_id=? AND status='SENT' AND to_instance='pool'",
+        (instance_id, instance_id, now, task_id))
+    if cur.rowcount != 1:
+        fresh = conn.execute("SELECT claimed_by, status FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone()
+        if fresh and fresh["status"] == "SENT" and fresh["claimed_by"] is None:
+            raise ValueError(f"任务 {task_id} 刚被并发改动，认领未生效")
+        raise TaskClaimConflict(task_id,
+                                fresh["claimed_by"] if fresh else None)
+
+    title = row["title"] or ""
+    conn.execute(
+        "INSERT INTO task_events (task_id, at, actor_instance, action, note, status_after) "
+        "VALUES (?,?,?,?,?,'RECEIVED')",
+        (task_id, now, instance_id, "claim", f"从池认领（第 "
+         f"{(row['claim_count'] or 0) + 1} 次）"))
+    _pool_event(conn, task_id, instance_id, "pool_task_claimed",
+                f"池任务 {task_id} 被 {instance_id} 认领：{title[:80]}",
+                f"claim_{(row['claim_count'] or 0) + 1}")
+    conn.commit()
+    return {"task_id": task_id, "claimed_by": instance_id, "status": "RECEIVED"}
+
+
+def release_task(conn: sqlite3.Connection, task_id: str, *,
+                 instance_id: str, reason: str) -> dict:
+    """认领者释放回池：状态回 SENT 待认领，记原因与次数，换别人接。
+
+    仅认领者可操作（claimed_by 校验 + WHERE 原子守卫）。释放重置认领期限。
+    """
+    if not (reason or "").strip():
+        raise ValueError("释放必须写明原因（release）")
+    row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"任务不存在：{task_id}")
+    if row["status"] in TASK_FINAL:
+        raise ValueError(f"任务已终结（{row['status']}），无需释放")
+    if row["to_instance"] != instance_id or (row["claimed_by"] or "") != instance_id:
+        raise ValueError(f"只有认领者 {row['claimed_by']} 能释放")
+
+    now = _now()
+    cur = conn.execute(
+        "UPDATE tasks SET to_instance=?, claimed_by=NULL, status='SENT', "
+        "updated_at=?, release_count=release_count+1, release_reason=?, "
+        "pool_entered_at=?, pool_deadline_at=?, pool_timeout_notified=0 "
+        "WHERE task_id=? AND claimed_by=? AND status IN "
+        f"({', '.join('?' * len(_POOL_RELEASEABLE))})",
+        [POOL_TO, now, reason.strip()[:500],
+         now, _deadline_from(now, POOL_CLAIM_DEADLINE_SECONDS),
+         task_id, instance_id, *_POOL_RELEASEABLE])
+    if cur.rowcount != 1:
+        fresh = conn.execute("SELECT status FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone()
+        raise ValueError(f"并发冲突：任务状态刚被改为 "
+                         f"{fresh['status'] if fresh else '（已不存在）'}，释放未生效")
+
+    conn.execute(
+        "INSERT INTO task_events (task_id, at, actor_instance, action, note, status_after) "
+        "VALUES (?,?,?,?,?,'SENT')",
+        (task_id, now, instance_id, "release",
+         f"释放回池：{reason.strip()[:200]}"))
+    _pool_event(conn, task_id, instance_id, "pool_task_released",
+                f"池任务 {task_id} 被 {instance_id} 释放回池：{reason.strip()[:120]}"
+                f"（已释放 {(row['release_count'] or 0) + 1} 次）",
+                f"release_{(row['release_count'] or 0) + 1}")
+    conn.commit()
+    return {"task_id": task_id, "status": "SENT",
+            "release_count": (row["release_count"] or 0) + 1}
+
+
+def assign_task(conn: sqlite3.Connection, task_id: str, *,
+                to_instance: str, actor_instance: str) -> dict:
+    """老板点选指派（§五①）：把池任务直接派给指定席位（含离线的）。
+
+    调用方（Muse/老板通道）经 Bearer 鉴权；只对在池里的 SENT 任务有效。
+    """
+    if conn.execute("SELECT 1 FROM instances WHERE instance_id=?",
+                    (to_instance,)).fetchone() is None:
+        raise ValueError(f"目标席位不存在：{to_instance}")
+    if to_instance == POOL_TO:
+        raise ValueError("指派目标不能是 pool 本身")
+    row = conn.execute("SELECT title FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"任务不存在：{task_id}")
+    now = _now()
+    cur = conn.execute(
+        "UPDATE tasks SET to_instance=?, updated_at=?, pool_timeout_notified=1, "
+        "pool_deadline_at=NULL "
+        "WHERE task_id=? AND status='SENT' AND to_instance='pool'",
+        (to_instance, now, task_id))
+    if cur.rowcount != 1:
+        fresh = conn.execute("SELECT status, to_instance FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone()
+        raise ValueError(f"任务不在池里（当前 {fresh['status']} → "
+                         f"{fresh['to_instance']}），指派未生效")
+    conn.execute(
+        "INSERT INTO task_events (task_id, at, actor_instance, action, note, status_after) "
+        "VALUES (?,?,?,?,?,'SENT')",
+        (task_id, now, actor_instance, "assign", f"老板点选指派 → {to_instance}"))
+    _pool_event(conn, task_id, actor_instance, "pool_task_assigned",
+                f"池任务 {task_id} 被指派给 {to_instance}（点选人：{actor_instance}）："
+                f"{(row['title'] or '')[:80]}", "assigned")
+    conn.commit()
+    return {"task_id": task_id, "to_instance": to_instance, "status": "SENT"}
+
+
+def pool_rearm(conn: sqlite3.Connection, task_id: str, *,
+               extra_seconds: int, actor_instance: str) -> dict:
+    """老板选「再挂一段时间」（§五②）：认领期限顺延，重新武装超时通知。"""
+    if int(extra_seconds) <= 0:
+        raise ValueError("extra_seconds 必须为正数")
+    row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"任务不存在：{task_id}")
+    if row["status"] != "SENT" or row["to_instance"] != POOL_TO:
+        raise ValueError(f"任务不在池里待认领（{row['status']} → "
+                         f"{row['to_instance']}），无法顺延")
+    now = _now()
+    conn.execute(
+        "UPDATE tasks SET pool_deadline_at=?, pool_timeout_notified=0, updated_at=? "
+        "WHERE task_id=? AND status='SENT' AND to_instance='pool'",
+        (_deadline_from(now, int(extra_seconds)), now, task_id))
+    conn.execute(
+        "INSERT INTO task_events (task_id, at, actor_instance, action, note, status_after) "
+        "VALUES (?,?,?,?,?,'SENT')",
+        (task_id, now, actor_instance, "pool_rearm",
+         f"顺延 {int(extra_seconds) // 60} 分钟"))
+    conn.commit()
+    return {"task_id": task_id,
+            "pool_deadline_at": _deadline_from(now, int(extra_seconds))}
+
+
+def pool_list(conn: sqlite3.Connection, *, limit: int = 50) -> list[dict]:
+    """待认领池任务（所有席位可读）。"""
+    rows = conn.execute(
+        "SELECT task_id, subject_id, from_instance, status, title, detail, context, "
+        "created_at, risk, claim_count, release_count, release_reason, "
+        "pool_entered_at, pool_deadline_at "
+        "FROM tasks WHERE to_instance='pool' AND status='SENT' "
+        "ORDER BY created_at LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _pool_seat_options(conn: sqlite3.Connection) -> list[dict]:
+    """超时通知里的席位选项（§四）：在线优先、同级按在跑任务最少，
+    POOL_SEAT_PRIORITY 里的排最前。含离线席位（老板可指派给离线的）。"""
+    seats = conn.execute(
+        "SELECT instance_id, last_seen_at FROM instances ORDER BY instance_id"
+    ).fetchall()
+    out = []
+    for s in seats:
+        iid = s["instance_id"]
+        running = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE to_instance=? AND status IN "
+            "('ACCEPTED','RUNNING','WAITING')", (iid,)).fetchone()[0]
+        online = _age_seconds(s["last_seen_at"]) <= POOL_ONLINE_SECONDS
+        out.append({"instance_id": iid, "online": online, "running": running})
+    prio = {iid: i for i, iid in enumerate(POOL_SEAT_PRIORITY)}
+    out.sort(key=lambda x: (not x["online"],          # 在线在前
+                            prio.get(x["instance_id"], 99),  # 名单优先
+                            x["running"]))            # 同级按在跑任务最少
+    return out
+
+
+def pool_sweep(conn: sqlite3.Connection) -> dict:
+    """池巡检（inbox-worker 每轮调用）：
+
+    ① 指定单转池：fallback_to_pool=1 且目标席位 fallback_after_seconds 内
+       没 accept（仍 SENT）→ 自动转入公共栏（验收 #2）。
+    ② 池任务超时：pool_deadline_at 已过且未通知过 → 发一条超时事件
+       （含席位选项清单），老板点选走 assign / rearm / cancel（验收 #4）。
+    两步都幂等：转池后状态/字段变化使条件不再命中；通知位 once-only。
+    """
+    now = _now()
+    fell_back: list[str] = []
+    # ① 指定单转池。判定信号是「没 accept」：本地巡检会代收件席自动签收
+    #   （receive=知悉登记），所以兜底状态要含 RECEIVED；一旦真被 accept
+    #   （含 risk=low 的自动接单）就视为已有人接，不再转池。
+    rows = conn.execute(
+        "SELECT task_id, from_instance, to_instance, title, fallback_after_seconds, "
+        "created_at FROM tasks WHERE fallback_to_pool=1 AND status IN "
+        "('SENT','RECEIVED') AND to_instance != 'pool'").fetchall()
+    for r in rows:
+        wait = _age_seconds(r["created_at"])
+        limit = int(r["fallback_after_seconds"]
+                    or POOL_CLAIM_DEADLINE_SECONDS)
+        if wait < limit:
+            continue
+        cur = conn.execute(
+            "UPDATE tasks SET to_instance='pool', status='SENT', claimed_by=NULL, "
+            "pool_entered_at=?, pool_deadline_at=?, updated_at=? "
+            "WHERE task_id=? AND fallback_to_pool=1 AND status IN ('SENT','RECEIVED') "
+            "AND to_instance != 'pool'",
+            (now, _deadline_from(now, POOL_CLAIM_DEADLINE_SECONDS), now,
+             r["task_id"]))
+        if cur.rowcount != 1:
+            continue
+        conn.execute(
+            "INSERT INTO task_events (task_id, at, actor_instance, action, note, "
+            "status_after) VALUES (?,?,?,?,?,'SENT')",
+            (r["task_id"], now, r["from_instance"], "fallback_to_pool",
+             f"{r['to_instance']} 超时未接（{limit} 秒），自动转入公共栏"))
+        _pool_event(conn, r["task_id"], r["from_instance"], "pool_task_fallback",
+                    f"任务 {r['task_id']} 原派 {r['to_instance']} 超时未接，"
+                    f"已转入公共栏：{(r['title'] or '')[:80]}", "fallback")
+        fell_back.append(r["task_id"])
+
+    # ② 池任务超时 → 老板选项事件（幂等：pool_timeout_notified once-only）
+    timed_out: list[str] = []
+    prows = conn.execute(
+        "SELECT task_id, from_instance, title, pool_deadline_at FROM tasks "
+        "WHERE to_instance='pool' AND status='SENT' AND pool_timeout_notified=0 "
+        "AND pool_deadline_at IS NOT NULL").fetchall()
+    for r in prows:
+        dl = r["pool_deadline_at"]
+        try:
+            overdue = datetime.fromisoformat(dl) <= datetime.fromisoformat(now)
+        except (TypeError, ValueError):
+            continue
+        if not overdue:
+            continue
+        cur = conn.execute(
+            "UPDATE tasks SET pool_timeout_notified=1, updated_at=? "
+            "WHERE task_id=? AND pool_timeout_notified=0",
+            (now, r["task_id"]))
+        if cur.rowcount != 1:
+            continue
+        opts = _pool_seat_options(conn)
+        parts = []
+        for o in opts:
+            state = "在线" if o["online"] else "离线"
+            extra = f"，在跑{o['running']}单" if o["running"] else ""
+            parts.append(f"{o['instance_id']}({state}{extra})")
+        opt_text = "；".join(parts)
+        conn.execute(
+            "INSERT INTO task_events (task_id, at, actor_instance, action, note, "
+            "status_after) VALUES (?,?,?,?,?,'SENT')",
+            (r["task_id"], now, r["from_instance"], "pool_timeout",
+             "认领期限已过无人接：老板可选 指派/再挂/取消"))
+        _pool_event(conn, r["task_id"], r["from_instance"], "pool_task_timeout",
+                    f"池任务 {r['task_id']} 超时无人认领：{(r['title'] or '')[:80]}。"
+                    f"请老板选：① 指派给某个席位（{opt_text}） ② 再挂一段时间 "
+                    f"③ 取消。执行：assign/rearm/cancel。",
+                    "timeout")
+        timed_out.append(r["task_id"])
+    conn.commit()
+    return {"fallback_to_pool": fell_back, "timeout_notified": timed_out}
 
 
 # ---------------------------------------------------------------------------

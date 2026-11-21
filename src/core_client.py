@@ -3,7 +3,7 @@
 它只依赖标准库，复制到 Muse 那台机器上就能跑。
 
     from core_client import CoreClient
-    c = CoreClient("https://<tailnet-host>.ts.net:8770", token="…")
+    c = CoreClient("https://<desktop-id>.<tailnet>.ts.net:8770", token="…")
     print(c.whoami())
 
     # 拉别人写的事件（增量）
@@ -196,6 +196,29 @@ class CoreClient:
             "note": note,
             "result": result,
         })
+
+    # --- 任务池（2026-11-21，Muse 设计）-------------------------------------
+    def pool_tasks(self, limit: int = 50) -> dict:
+        """公共栏待认领池任务（所有席位可读）。"""
+        return self.get("/api/tasks/pool", limit=limit)
+
+    def claim(self, task_id: str, instance_id: str) -> dict:
+        """原子认领。已被其他席位认领 → CoreError(409)。
+
+        认领成功后 to_instance 变为本席位、状态进 RECEIVED，
+        后续 accept/result/租约/审批全部走既有通道。
+        """
+        return self.post(f"/api/tasks/{task_id}/claim", {"instance_id": instance_id})
+
+    def release(self, task_id: str, instance_id: str, reason: str) -> dict:
+        """认领者释放回池（仅认领者可操作，记原因与次数）。"""
+        return self.post(f"/api/tasks/{task_id}/release",
+                         {"instance_id": instance_id, "reason": reason})
+
+    def assign(self, task_id: str, to_instance: str, instance_id: str) -> dict:
+        """老板点选指派（超时选项①执行入口）。"""
+        return self.post(f"/api/tasks/{task_id}/assign",
+                         {"to_instance": to_instance, "instance_id": instance_id})
 
     # --- M4：心跳与在线状态 -------------------------------------------------
     def heartbeat(self, instance_id: str) -> dict:

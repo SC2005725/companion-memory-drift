@@ -33,6 +33,8 @@ class Settings:
     # 小满的自我模型配置（反馈关键词等）。与 user_model 并列的第二个模型。
     self_model: dict = field(default_factory=dict)
     heartbeat: dict = field(default_factory=dict)
+    # M-6 v2 按条蒸馏（2026-11-21）：segment_turns>0 时整理按段拆分蒸馏
+    consolidate: dict = field(default_factory=dict)
     # Memory V1：memory 段整块保留，供生命周期与自动整理读取
     memory: dict = field(default_factory=dict)
     tools: dict = field(default_factory=dict)
@@ -93,6 +95,7 @@ def load_settings() -> Settings:
         heartbeat=heartbeat,
         tools=tools,
         model_router=model_router,
+        consolidate=(raw.get("consolidate") or {}),
     )
 
 

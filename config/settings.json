@@ -290,7 +290,9 @@
       "_enforce_point": "在统一出口 chat.call_model 前置检查，本月花费按 api_calls 表 UTC 自然月 SUM(cost_micro_yuan) 统计；硬线拦截是非必要用途（consolidate/probe/doctor 等）直接不发请求，BudgetExceeded 继承 LLMError，调用方既有兜底不变。",
       "monthly_yuan": 30,
       "soft_ratio": 0.8,
-      "exempt_purposes": ["chat"]
+      "exempt_purposes": [
+        "chat"
+      ]
     }
   },
   "raw_event_triggers": {
@@ -391,11 +393,20 @@
       "read_file",
       "run_python",
       "take_note",
-      "now"
+      "now",
+      "dispatch_task",
+      "self_check",
+      "web_search",
+      "web_fetch"
     ],
     "_now_note": "now = 查询当前本地时间。用户明确要求过（「你可以接入时间吗」），且中午说「晚安」的事故就是缺它。零依赖、无副作用、只需 read 权限。",
     "_enabled_meaning": "工具级开关；即使列在这里，权限档不够仍然不可用（例如 run_python 需要 execute）。",
     "max_iterations": 5,
-    "_max_iterations_meaning": "一轮对话里最多执行几次工具，防止模型陷入工具循环。"
+    "_max_iterations_meaning": "一轮对话里最多执行几次工具，防止模型陷入工具循环。",
+    "fs_extra_write_dirs": []
+  },
+  "consolidate": {
+    "_comment": "按条蒸馏 v2（2026-11-21）：segment_turns>0 且积压轮次超过段长时，整理把新对话拆段、逐段聚焦蒸馏，再合并进同一版本（每段都带原始事件+记忆摘要）。=0 保持旧的一次一次全量调用。40 ≈ 一次正常的整理窗口。",
+    "segment_turns": 40
   }
 }
